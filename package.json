@@ -10,7 +10,8 @@
     "start": "node backend/server.js",
     "dev": "node --watch backend/server.js",
     "build:render": "node scripts/prepare-render-static.js",
-    "push:github": "node scripts/push-to-github.js"
+    "push:github": "node scripts/push-to-github.js",
+    "deploy:render": "node scripts/deploy-to-render.js"
   },
   "keywords": [
     "iot",
