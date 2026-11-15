@@ -48,7 +48,7 @@
 // BOARD IDENTITY & INTERNET OTA METADATA
 // ============================================================================
 const char* BOARD_TYPE            = "esp32_wroom"; // Matches Manufacturer Portal "esp32_wroom"
-const char* FIRMWARE_VERSION      = "2.2.0";
+const char* FIRMWARE_VERSION      = "2.3.0";
 
 // Optional Workshop / Hotspot Wi-Fi for ultra-fast 5-second OTA (falls back to SIM800L Cellular GPRS automatically!)
 const char* WIFI_OTA_SSID         = "";            // Optional: e.g. "Boda360_Hotspot"
@@ -138,6 +138,13 @@ unsigned long lastMqttPingMs      = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 3000UL;
 const unsigned long MQTT_RETRY_INTERVAL_MS = 25000UL;
 
+// Smart Motion & Vibration-Wake Battery Saver Sleep State
+bool          isPowerSaveSleep            = false;
+unsigned long lastMotionOrVibMs           = 0;
+const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // 3 minutes of 0 motion & 0 vibration enters Smart Sleep
+const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
+const float         MOTION_SPEED_THRESHOLD_KMH  = 1.8f;     // Stay awake whenever GPS speed >= 1.8 km/h
+
 // Voice Call & Local Alarm State
 bool   voiceCallActive          = false;
 unsigned long voiceCallStartMs  = 0;
@@ -220,6 +227,9 @@ void refreshMqttTopics();
 void normalizeAndSavePhoneNvs(const String& rawPhone);
 void printIdentityCard();
 bool isAuthorizedOwnerSender(const String& sender);
+void manageSmartSleepMode();
+void enterSmartSleepMode();
+void exitSmartSleepMode(const char* wakeReason);
 
 // ============================================================================
 // SETUP
@@ -230,6 +240,7 @@ void setup() {
 
   // 0. Load NVS Permanent Identity + Derive Unique 15-Digit ESP32 Silicon ID Fallback
   loadIdentityFromNvs();
+  lastMotionOrVibMs = millis();
 
   Serial.println("==================================================================");
   Serial.println("BODA 360 TELEMATICS — ESP32-WROOM + SIM800L VOICE + NEO-6M GPS");
@@ -314,15 +325,20 @@ void loop() {
 
   // 5. Execute Queued Internet OTA Firmware Upgrade Safely
   if (pendingOtaExecution) {
+    if (isPowerSaveSleep) exitSmartSleepMode("OTA_UPDATE");
     pendingOtaExecution = false;
     executeInternetOtaUpdate(pendingOtaUrl, pendingOtaVersion, pendingOtaMd5);
   }
 
-  // 6. Periodic 3-Second Telemetry, Battery Cut Check & Geofence Perimeter Check
-  if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+  // 5B. Manage Smart Stationary Sleep Mode & Motion Keep-Awake
+  manageSmartSleepMode();
+
+  // 6. Periodic Telemetry (3s while awake/moving; 60s heartbeat while in Smart Sleep)
+  unsigned long activeInterval = isPowerSaveSleep ? SLEEP_HEARTBEAT_INTERVAL_MS : TELEMETRY_INTERVAL_MS;
+  if (millis() - lastTelemetryMs >= activeInterval) {
     lastTelemetryMs = millis();
 
-    if (sim800Ready && !voiceCallActive) {
+    if (sim800Ready && !voiceCallActive && !isPowerSaveSleep) {
       String csqResp = sendAT("AT+CSQ", 500);
       int idx = csqResp.indexOf("+CSQ:");
       if (idx >= 0) {
@@ -334,7 +350,9 @@ void loop() {
       }
     }
 
-    checkGeofencePerimeter();
+    if (!isPowerSaveSleep) {
+      checkGeofencePerimeter();
+    }
 
     if (!mqttConnected && !voiceCallActive && (millis() - lastMqttRetryMs >= MQTT_RETRY_INTERVAL_MS)) {
       lastMqttRetryMs = millis();
@@ -985,6 +1003,15 @@ void checkPiezoVibrationSensor() {
     ? (0.992f * piezoBaseline + 0.008f * raw)
     : (0.9995f * piezoBaseline + 0.0005f * raw);
 
+  // Sensitive Vibration Wake Detector: Even light frame/engine vibration keeps the bike awake
+  // or immediately wakes it from Stationary Smart Sleep Mode (< 2ms)!
+  if (delta >= 28) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("PIEZO_VIBRATION");
+    }
+  }
+
   if (delta >= piezoTamperThreshold && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
     delayMicroseconds(50);
     int confirm = abs(readFilteredPiezoADC() - (int)roundf(piezoBaseline));
@@ -1035,10 +1062,71 @@ void checkMpu6050Tamper() {
   float deltaG = fabsf(totalG - previousGForce);
   previousGForce = totalG;
 
+  if (deltaG >= 0.18f) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("MPU6050_MOTION");
+    }
+  }
+
   if (deltaG > 3.2f && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
     lastTamperAlertMs = millis();
     triggerTamperAlert(deltaG, 0, "MPU6050");
   }
+}
+
+void manageSmartSleepMode() {
+  if (gps.hasFix && gps.speedKmh >= MOTION_SPEED_THRESHOLD_KMH) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("GPS_MOTION");
+    }
+    return;
+  }
+
+  if (localAlarmActive || voiceCallActive || pendingOtaExecution) {
+    lastMotionOrVibMs = millis();
+    return;
+  }
+
+  if (!isPowerSaveSleep && (millis() - lastMotionOrVibMs >= STATIONARY_SLEEP_TIMEOUT_MS)) {
+    enterSmartSleepMode();
+  }
+}
+
+void enterSmartSleepMode() {
+  if (isPowerSaveSleep) return;
+  isPowerSaveSleep = true;
+
+  Serial.println("[SLEEP MODE] 🌙 Motorcycle stationary for 3 mins (0 vibration, 0 motion) -> Entering Smart Battery-Saver Sleep...");
+  sendAck("POWER_MODE", "SLEEP_STATIONARY_BATTERY_SAVER");
+
+  if (sim800Ready) {
+    // Enable SIM800L Automatic Clock Sleep (AT+CSCLK=2: sleeps automatically when UART is idle, wakes on SMS/Call/UART)
+    sendAT("AT+CSCLK=2", 800);
+  }
+
+  // Scale ESP32 CPU down to 80 MHz while keeping Piezo Vibration ADC (GPIO 32) active!
+  setCpuFrequencyMhz(80);
+}
+
+void exitSmartSleepMode(const char* wakeReason) {
+  lastMotionOrVibMs = millis();
+  if (!isPowerSaveSleep) return;
+  isPowerSaveSleep = false;
+
+  setCpuFrequencyMhz(240);
+  Serial.println("[WAKE UP] ⚡ Waking from Smart Sleep — Reason: " + String(wakeReason));
+
+  if (sim800Ready) {
+    // Send dummy AT character to wake SIM800L UART from AT+CSCLK=2 auto-sleep, then disable sleep
+    SerialSIM800.println("AT");
+    delay(60);
+    sendAT("AT+CSCLK=0", 800);
+  }
+
+  sendAck("POWER_MODE", "AWAKE_" + String(wakeReason));
+  lastTelemetryMs = 0;
 }
 
 // ============================================================================

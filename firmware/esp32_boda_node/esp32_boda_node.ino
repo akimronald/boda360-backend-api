@@ -30,7 +30,7 @@
 
 // DUAL-BOARD INTERNET OTA IDENTITY (Board #1: LILYGO T-SIM7000G)
 const char* BOARD_TYPE        = "lilygo_tsim7000g";
-const char* FIRMWARE_VERSION  = "2.2.0";
+const char* FIRMWARE_VERSION  = "2.3.0";
 const char* WIFI_OTA_SSID     = ""; // Optional Wi-Fi / mobile hotspot SSID for fast OTA (falls back to SIM7000G Cellular HTTP)
 const char* WIFI_OTA_PASS     = "";
 
@@ -87,8 +87,15 @@ bool isImmobilized  = false;
 
 unsigned long lastTelemetryTime     = 0;
 unsigned long lastMqttReconnectTry  = 0;
-const unsigned long TELEMETRY_INTERVAL      = 3000;   // 3s telemetry cadence
+const unsigned long TELEMETRY_INTERVAL      = 3000;   // 3s telemetry cadence while awake / in motion
 const unsigned long MQTT_RECONNECT_INTERVAL = 30000;  // 30s cellular MQTT retry
+
+// Smart Motion & Vibration-Wake Battery Saver Sleep State
+bool          isPowerSaveSleep            = false;
+unsigned long lastMotionOrVibMs           = 0;
+const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // Enter sleep after 3 mins (180,000 ms) of 0 motion & 0 vibration
+const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
+const float         MOTION_SPEED_THRESHOLD_KMH  = 1.8f;     // Stay awake whenever GPS speed >= 1.8 km/h
 
 // Marked Perimeter (Geofence) & 10-Minute SMS Alert State
 bool   geofenceAnchored        = false; // Anchors to first 3D GPS fix unless Portal sets custom center
@@ -188,6 +195,9 @@ void refreshMqttTopics();
 void normalizeAndSavePhoneNvs(const String& rawPhone);
 bool isAuthorizedOwnerSender(const String& sender);
 void printIdentityCard();
+void manageSmartSleepMode();
+void enterSmartSleepMode();
+void exitSmartSleepMode(const char* wakeReason);
 
 void setup() {
   Serial.begin(115200);
@@ -195,6 +205,7 @@ void setup() {
 
   // Load Permanent NVS Identity + Derive Unique 15-Digit ESP32 Chip ID Fallback
   loadIdentityFromNvs();
+  lastMotionOrVibMs = millis();
 
   Serial.println("=================================================");
   Serial.println("ISBAT UNIVERSITY - BODA-BODA TELEMATICS SYSTEM");
@@ -253,24 +264,26 @@ void setup() {
   }
 
   sendAck("BOOT_READY", "ONLINE_V" + String(FIRMWARE_VERSION));
-  Serial.println("[INFO] Commands: WHOAMI | SET_IMEI:<15d> | CLEAR_IMEI | SET_PHONE:<num> | SET_PLATE:<plt> | ENGINE_CUT | ENGINE_RESTORE");
+  Serial.println("[INFO] Commands: WHOAMI | SLEEP_NOW | WAKE_NOW | SET_IMEI:<15d> | CLEAR_IMEI | SET_PHONE:<num> | SET_PLATE:<plt> | ENGINE_CUT | ENGINE_RESTORE");
 }
 
 void loop() {
   // 1. High-speed Analog Piezoelectric Ceramic Vibration/Shock Sampling (GPIO 32)
+  //    Senses even gentle vibrations to immediately wake the board from Smart Sleep!
   checkPiezoVibrationSensor();
 
   // 2. Non-blocking Offline Local Alarm Buzzer & LED Strobe Timer
   manageLocalAlarm();
   manageActiveVoiceCall();
 
-  // 3. Poll asynchronous SIM7000G URCs (incoming cellular MQTT commands +SMSUB)
+  // 3. Poll asynchronous SIM7000G URCs (incoming cellular MQTT commands +SMSUB / SMS)
   if (modemReady) {
     checkModemURC();
   }
 
   // 3B. Execute Deferred Internet OTA Firmware Update Safely
   if (pendingOtaExecution) {
+    if (isPowerSaveSleep) exitSmartSleepMode("OTA_UPDATE");
     pendingOtaExecution = false;
     executeLilygoInternetOta(pendingOtaUrl, pendingOtaVersion, pendingOtaMd5);
   }
@@ -280,10 +293,15 @@ void loop() {
     checkTamperSensor();
   }
 
+  // 4B. Manage Smart Stationary Sleep Mode & Motion Keep-Awake
+  manageSmartSleepMode();
+
   // 5. Periodic GNSS Poll, Marked Perimeter Check & Telemetry Transmission
-  if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL) {
+  //    (3s cadence while awake/moving; 60s low-power heartbeat while in Smart Sleep)
+  unsigned long activeInterval = isPowerSaveSleep ? SLEEP_HEARTBEAT_INTERVAL_MS : TELEMETRY_INTERVAL;
+  if (millis() - lastTelemetryTime >= activeInterval) {
     lastTelemetryTime = millis();
-    if (modemReady) {
+    if (modemReady && !isPowerSaveSleep) {
       updateGnssAndSignal();
       checkGeofencePerimeter();
 
@@ -300,14 +318,21 @@ void loop() {
     String serialCmd = Serial.readStringUntil('\n');
     serialCmd.trim();
     if (serialCmd.equalsIgnoreCase("TEST_SMS")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("SERIAL_CMD");
       sendGeofenceSmsAlert(gnss.latitude, gnss.longitude, 0.0, gnss.speedKmh, true);
     } else if (serialCmd.equalsIgnoreCase("TEST_TAMPER")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("TEST_TAMPER");
       lastVoiceCallMs = 0;
       lastTamperSmsMs = 0;
       triggerTamperAlert(4.8f, 320, "TEST_TAMPER");
     } else if (serialCmd.equalsIgnoreCase("TEST_CALL")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("TEST_CALL");
       lastVoiceCallMs = 0;
       placeTamperVoiceCall("MANUAL_TEST_CALL");
+    } else if (serialCmd.equalsIgnoreCase("SLEEP_NOW")) {
+      enterSmartSleepMode();
+    } else if (serialCmd.equalsIgnoreCase("WAKE_NOW")) {
+      exitSmartSleepMode("MANUAL_WAKE");
     } else if (serialCmd.equalsIgnoreCase("WHOAMI")) {
       printIdentityCard();
     } else if (serialCmd.startsWith("GEOFENCE_SET:")) {
@@ -668,6 +693,7 @@ void handleUrcLine(const String& line) {
   }
 
   if (line.startsWith("+CMT:")) {
+    if (isPowerSaveSleep) exitSmartSleepMode("INCOMING_SMS");
     int q1 = line.indexOf('"');
     int q2 = line.indexOf('"', q1 + 1);
     incomingSmsSender = (q1 >= 0 && q2 > q1) ? line.substring(q1 + 1, q2) : "";
@@ -676,6 +702,7 @@ void handleUrcLine(const String& line) {
   }
 
   if (line.startsWith("+SMSUB:")) {
+    if (isPowerSaveSleep) exitSmartSleepMode("MQTT_COMMAND");
     int firstComma = line.indexOf(',');
     if (firstComma > 0) {
       String topicPart = line.substring(7, firstComma);
@@ -999,6 +1026,14 @@ void updateGnssAndSignal() {
     gnss.longitude  = lngStr.toDouble();
     gnss.speedKmh   = speedStr.length() ? speedStr.toFloat() : 0.0f;
     gnss.headingDeg = courseStr.length() ? courseStr.toFloat() : 0.0f;
+
+    // Keep board 100% awake whenever the motorcycle is in motion (speed >= 1.8 km/h)
+    if (gnss.speedKmh >= MOTION_SPEED_THRESHOLD_KMH) {
+      lastMotionOrVibMs = millis();
+      if (isPowerSaveSleep) {
+        exitSmartSleepMode("GPS_MOTION");
+      }
+    }
   } else {
     gnss.hasFix = false;
   }
@@ -1013,7 +1048,7 @@ void publishTelemetryPayload() {
 
   double lat = gnss.latitude;
   double lng = gnss.longitude;
-  float speed = hasFix ? gnss.speedKmh : 0.0f;
+  float speed = (hasFix && !isPowerSaveSleep) ? gnss.speedKmh : 0.0f;
   float heading = hasFix ? gnss.headingDeg : 0.0f;
 
   int rawADC = analogRead(PIN_BATTERY_ADC);
@@ -1035,6 +1070,7 @@ void publishTelemetryPayload() {
   payload += "\"fw_version\":\"" + String(FIRMWARE_VERSION) + "\",";
   payload += "\"plate\":\"" + bikePlate + "\",";
   payload += "\"owner_phone\":\"" + alertPhoneLocal + "\",";
+  payload += "\"power_mode\":\"" + String(isPowerSaveSleep ? "SLEEP" : "ACTIVE") + "\",";
   payload += "\"latitude\":" + String(lat, 6) + ",";
   payload += "\"longitude\":" + String(lng, 6) + ",";
   payload += "\"speed\":" + String(speed, 1) + ",";
@@ -1047,7 +1083,15 @@ void publishTelemetryPayload() {
   payload += "\"gps_lock\":" + String(hasFix ? "true" : "false");
   payload += "}";
 
+  // Briefly wake SIM7000G DTR pin if publishing a 60s parked sleep heartbeat
+  if (isPowerSaveSleep && modemReady) {
+    digitalWrite(PIN_MODEM_DTR, LOW);
+    delay(40);
+  }
   bool sentCell = sim7000PublishMqtt(TOPIC_TELEMETRY, payload);
+  if (isPowerSaveSleep && modemReady) {
+    digitalWrite(PIN_MODEM_DTR, HIGH);
+  }
 
   Serial.println("[MQTT TX -> " + TOPIC_TELEMETRY + "]: " + payload);
   Serial.print("[GPS STATUS] Carrier: ");
@@ -1139,6 +1183,16 @@ void checkPiezoVibrationSensor() {
     piezoBaseline = (0.9995f * piezoBaseline) + (0.0005f * (float)filteredRaw);
   }
 
+  // Sensitive Vibration Wake Detector: Even light frame/engine vibration keeps the bike awake
+  // or immediately wakes it from Stationary Smart Sleep Mode (< 2ms)!
+  int vibWakeThreshold = max(25, (piezoNoisePeak * 2) + 12);
+  if (delta >= vibWakeThreshold) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("PIEZO_VIBRATION");
+    }
+  }
+
   if (delta >= piezoTamperThreshold && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
     delayMicroseconds(50); // Stay near crest of 1-2 kHz piezo half-wave (not 400us zero-crossing!)
     int confirmDelta = abs(readFilteredPiezoADC() - baseInt);
@@ -1170,10 +1224,94 @@ void checkTamperSensor() {
   float deltaG = abs(totalAcc - previousGForce);
   previousGForce = totalAcc;
 
+  // Wake from Smart Sleep on any motorcycle tilt or movement (>= 0.18G)
+  if (deltaG >= 0.18f) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("MPU6050_MOTION");
+    }
+  }
+
   if (deltaG > TAMPER_THRESHOLD_G && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
     lastTamperAlertMs = millis();
     triggerTamperAlert(deltaG, 0, "MPU6050");
   }
+}
+
+/**
+ * Smart Motion & Vibration-Wake Battery Saver Engine:
+ *   - Stays 100% awake when motorcycle is in motion (speed >= 1.8 km/h) or vibrating.
+ *   - Enters low-power sleep after 3 minutes of zero motion & zero vibration.
+ *   - Immediately wakes (< 2ms) the instant vibration (GPIO 32 / MPU6050), motion, or a command is sensed.
+ */
+void manageSmartSleepMode() {
+  // Always stay awake if moving, ringing alarm, on a voice call, or running OTA
+  if (gnss.hasFix && gnss.speedKmh >= MOTION_SPEED_THRESHOLD_KMH) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("GPS_MOTION");
+    }
+    return;
+  }
+
+  if (localAlarmActive || voiceCallActive || pendingOtaExecution) {
+    lastMotionOrVibMs = millis();
+    return;
+  }
+
+  if (!isPowerSaveSleep && (millis() - lastMotionOrVibMs >= STATIONARY_SLEEP_TIMEOUT_MS)) {
+    enterSmartSleepMode();
+  }
+}
+
+void enterSmartSleepMode() {
+  if (isPowerSaveSleep) return;
+  isPowerSaveSleep = true;
+
+  Serial.println("[SLEEP MODE] 🌙 Motorcycle stationary for 3 mins (0 vibration, 0 motion) -> Entering Smart Battery-Saver Sleep...");
+  sendAck("POWER_MODE", "SLEEP_STATIONARY_BATTERY_SAVER");
+
+  if (modemReady) {
+    // Pause high-current GPS/GNSS engine & active antenna while parked still (~45mA saved)
+    sendAT("AT+CGNSPWR=0", 1000);
+    sendAT("AT+SGPIO=0,4,1,0", 800);
+    gnssEnabled = false;
+
+    // Enable SIM7000G DTR Clock Sleep (DTR HIGH = Modem Sleep < 2mA, still wakes on SMS/Call/MQTT)
+    sendAT("AT+CSCLK=1", 800);
+    digitalWrite(PIN_MODEM_DTR, HIGH);
+  }
+
+  // Scale ESP32 CPU down to 80 MHz while keeping Piezo Vibration ADC (GPIO 32) active!
+  setCpuFrequencyMhz(80);
+}
+
+void exitSmartSleepMode(const char* wakeReason) {
+  lastMotionOrVibMs = millis();
+  if (!isPowerSaveSleep) return;
+  isPowerSaveSleep = false;
+
+  // Restore full 240 MHz ESP32 CPU speed immediately (< 1ms)
+  setCpuFrequencyMhz(240);
+
+  Serial.println("[WAKE UP] ⚡ Waking from Smart Sleep — Reason: " + String(wakeReason));
+
+  if (modemReady) {
+    // Pull DTR LOW to wake SIM7000G UART immediately
+    digitalWrite(PIN_MODEM_DTR, LOW);
+    delay(40);
+    sendAT("AT+CSCLK=0", 800);
+
+    // Re-enable Active GPS Antenna & Multi-Constellation GNSS Engine for 3s live tracking
+    sendAT("AT+SGPIO=0,4,1,1", 800);
+    sendAT("AT+CGPIO=0,48,1,1", 800);
+    if (sendAT("AT+CGNSPWR=1", 1200).indexOf("OK") >= 0) {
+      gnssEnabled = true;
+    }
+  }
+
+  sendAck("POWER_MODE", "AWAKE_" + String(wakeReason));
+  lastTelemetryTime = 0; // Force immediate telemetry transmission
 }
 
 /**

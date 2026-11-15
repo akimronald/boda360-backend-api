@@ -7,35 +7,40 @@
  *   - Integrated Cellular + GNSS Modem: SIM7000G (UART1: RX=26, TX=27, PWR=4, DTR=25)
  *       * Streams live 3D GPS & MQTT over MTN Uganda ("internet" APN)
  *       * Sends GPS Breach SMS to +256748802162 every 10 mins outside perimeter
- *       * Triggers Tamper & 12V Battery-Cut Voice Call + SMS to 0748802162 / +256748802162
+ *       * Triggers Tamper Voice Call to 0748802162 via SIM7000G ATD + Cloud Voice Gateway
  *   - Onboard Status Blue LED: GPIO 12 (Active LOW: LOW=ON/Running, HIGH=OFF/Cut)
  *   - Piezo Vibration / Tamper Sensor: Analog Piezoelectric Ceramic Sensor (ADC1: GPIO 32)
- *   - Motion-Gating IMU: MPU6050 6-Axis Accelerometer + Gyro (I2C: SDA=21, SCL=22)
- *       * Detects sustained riding motion & suppresses Piezo tamper messages while moving
- *   - Immobilization Actuator: 2-Way (2-Channel) 5V Relay Module — Channel 1 (IN1 -> GPIO 23, COM1 & NC1)
- *   - Battery Voltage & Power-Cut Tamper Sense:
- *       * External 12V Motorcycle Battery Divider (GPIO 34: R1=100k to +12V, R2=22k to GND)
- *       * Onboard 18650 Backup Battery ADC (GPIO 35: keeps ESP32+SIM7000G alive when 12V cut)
+ *   - Optional Inertial Sensor: MPU6050 6-Axis Accelerometer (I2C: SDA=21, SCL=22)
+ *   - Immobilization Actuator: 5V Relay Module (GPIO 23 - Normally Closed / Open)
+ *   - Battery Voltage Sense: External 12V Divider (GPIO 34) + Onboard 18650 ADC (GPIO 35)
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <WString.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <Preferences.h>
 #include <math.h>
 #include <PubSubClient.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 
+// DUAL-BOARD INTERNET OTA IDENTITY (Board #1: LILYGO T-SIM7000G)
+const char* BOARD_TYPE        = "lilygo_tsim7000g";
+const char* FIRMWARE_VERSION  = "2.3.0";
+const char* WIFI_OTA_SSID     = ""; // Optional Wi-Fi / mobile hotspot SSID for fast OTA (falls back to SIM7000G Cellular HTTP)
+const char* WIFI_OTA_PASS     = "";
+
 // LILYGO T-SIM7000G + PERIPHERAL PIN DEFINITIONS
 #define PIN_BLUE_LED          12 // T-SIM7000G Onboard Blue LED (Active LOW: LOW=ON, HIGH=OFF)
 #define PIN_ALARM_BUZZER      14 // Offline Local Siren / Active Piezo Buzzer output (HIGH = Alarm ON)
-#define PIN_RELAY_IMMOBILIZER 23 // 2-Way Relay Channel 1 (IN1 -> GPIO 23)
+#define PIN_RELAY_IMMOBILIZER 23 // HIGH = Relay Energized / CDI Ignition Cut-off
 #define PIN_PIEZO_VIBRATION   32 // Analog Piezoelectric Ceramic Vibration Sensor (ADC1_CH4)
 #define PIN_BATTERY_ADC       34 // External 12V Motorcycle Battery divider (R1=100k, R2=22k)
-#define PIN_ONBOARD_BAT_ADC   35 // LILYGO T-SIM7000G onboard 18650 backup battery divider
-#define PIN_MPU_SDA           21 // MPU6050 I2C Data (SDA)
-#define PIN_MPU_SCL           22 // MPU6050 I2C Clock (SCL)
+#define PIN_ONBOARD_BAT_ADC   35 // LILYGO T-SIM7000G onboard 18650 battery divider
 
 // Internal SIM7000G (UART1: Data, MQTT, 3D GPS, Geofence SMS & Tamper Call Trigger)
 #define PIN_MODEM_RX          26 // ESP32 RX <- SIM7000G TX
@@ -43,17 +48,23 @@
 #define PIN_MODEM_PWR         4  // SIM7000G PWRKEY
 #define PIN_MODEM_DTR         25 // SIM7000G DTR (LOW = Awake)
 
-// CONFIGURATION & EMERGENCY CONTACT PARAMETERS
-const char* PROVISIONED_IMEI  = "865421045981201"; // Bound motorcycle node ID (Plate: UEV 412K)
-const char* BIKE_PLATE        = "UEV 412K";
-const char* ALERT_PHONE_LOCAL = "0748802162";      // Owner phone for Tamper / Battery-Cut Voice Call
-const char* ALERT_PHONE_INTL  = "+256748802162";   // Owner phone for SIM7000G SMS Alerts
-const char* CELLULAR_APN      = "internet";        // MTN Uganda / Airtel Uganda universal APN
-const char* MQTT_SERVER       = "broker.hivemq.com";
-const int   MQTT_PORT         = 1883;
+// FACTORY FALLBACK PARAMETERS (Overridden automatically by NVS Flash + SIM7000G AT+GSN + Customer Sign-Up Sync!)
+const char* DEFAULT_FALLBACK_PLATE = "UNBOUND";
+const char* DEFAULT_PHONE_LOCAL    = "0748802162";      // Default owner phone for Tamper Voice Call
+const char* DEFAULT_PHONE_INTL     = "+256748802162";   // Default owner phone for SIM7000G Geofence SMS
+const char* CELLULAR_APN           = "internet";        // MTN Uganda / Airtel Uganda universal APN
+const char* MQTT_SERVER            = "broker.hivemq.com";
+const int   MQTT_PORT              = 1883;
 
-String deviceImei   = PROVISIONED_IMEI;
-String hardwareImei = "869951038535641";
+Preferences nvs; // Permanent Non-Volatile Storage (survives reboots & Internet OTA!)
+String chipFallbackImei = "";
+String hardwareImei     = "";
+String deviceImei       = "";
+bool   imeiCustomLocked = false;
+String bikePlate        = DEFAULT_FALLBACK_PLATE;
+String alertPhoneLocal  = DEFAULT_PHONE_LOCAL;
+String alertPhoneIntl   = DEFAULT_PHONE_INTL;
+String ownerEmail       = "";
 
 // MQTT TOPICS
 String TOPIC_TELEMETRY;
@@ -73,12 +84,18 @@ bool pdpActive      = false;
 bool mqttConnected  = false;
 bool mpuAvailable   = false;
 bool isImmobilized  = false;
-bool relayActiveLow = true;  // Standard 2-Way (2-Channel) 5V Relay Modules trigger ON when IN1 = LOW
 
 unsigned long lastTelemetryTime     = 0;
 unsigned long lastMqttReconnectTry  = 0;
-const unsigned long TELEMETRY_INTERVAL      = 3000;   // 3s telemetry cadence
+const unsigned long TELEMETRY_INTERVAL      = 3000;   // 3s telemetry cadence while awake / in motion
 const unsigned long MQTT_RECONNECT_INTERVAL = 30000;  // 30s cellular MQTT retry
+
+// Smart Motion & Vibration-Wake Battery Saver Sleep State
+bool          isPowerSaveSleep            = false;
+unsigned long lastMotionOrVibMs           = 0;
+const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // Enter sleep after 3 mins (180,000 ms) of 0 motion & 0 vibration
+const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
+const float         MOTION_SPEED_THRESHOLD_KMH  = 1.8f;     // Stay awake whenever GPS speed >= 1.8 km/h
 
 // Marked Perimeter (Geofence) & 10-Minute SMS Alert State
 bool   geofenceAnchored        = false; // Anchors to first 3D GPS fix unless Portal sets custom center
@@ -89,7 +106,7 @@ bool   isOutsidePerimeter      = false;
 unsigned long lastGeofenceSmsMs = 0;
 const unsigned long GEOFENCE_SMS_INTERVAL_MS = 600000UL; // 10 minutes (600,000 ms) between breach SMS
 
-// Offline Local Siren/Strobe & Direct SIM7000G Tamper SMS / Voice Call Management
+// Offline Local Siren/Strobe & Direct SIM7000G Tamper SMS Management
 bool   localAlarmActive         = false;
 unsigned long localAlarmStartMs = 0;
 unsigned long lastStrobeStepMs  = 0;
@@ -121,130 +138,100 @@ struct GnssState {
   String carrier = "MTN-UGANDA";
 } gnss;
 
-// Vibration Tamper Thresholds (Analog Piezo on GPIO 32)
+// Vibration Tamper Thresholds (Analog Piezo on GPIO 32 + Optional MPU6050)
 float piezoBaseline = 475.0f;
 int piezoNoisePeak = 10;
 int windowPeakPiezoDelta = 0;
 int piezoTamperThreshold = 85;
 unsigned long lastTamperAlertMs = 0;
 unsigned long lastModemRfActivityMs = 0;
-unsigned long lastMutedVibrationLogMs = 0;
 const unsigned long TAMPER_COOLDOWN_MS = 5000;
 
-// MPU6050 Motion-Gating State (Suppresses Piezo tamper messages while motorcycle is in motion)
-bool  bikeInMotion               = false;
-int   mpuMotionScore             = 0;
-float mpuGravityBaseG            = 1.0f;
-float mpuGyroBiasX               = 0.0f;
-float mpuGyroBiasY               = 0.0f;
-float mpuGyroBiasZ               = 0.0f;
-float lastMpuDynAccG             = 0.0f;
-float lastMpuGyroRad             = 0.0f;
-unsigned long lastMpuSampleMs    = 0;
-unsigned long lastMotionActiveMs = 0;
+float previousGForce = 1.0;
+const float TAMPER_THRESHOLD_G = 3.2;
 
-const unsigned long MPU_SAMPLE_INTERVAL_MS = 50;    // 20 Hz non-blocking I2C poll (preserves fast Piezo ADC loop)
-const unsigned long MOTION_HOLD_MS         = 6000;  // Keep tamper muted for 6s after stopping (traffic/bumps)
-const float MOTION_ACC_THRESHOLD_G         = 0.08f; // Continuous linear acceleration delta above resting gravity
-const float MOTION_GYRO_THRESHOLD_RAD      = 0.12f; // Continuous tilt/steering/rolling rotation (~6.9 deg/s)
-const int   MOTION_SCORE_MAX               = 40;
-const int   MOTION_ENTER_SCORE             = 20;    // ~0.5s of sustained movement enters motion-mute state
-
-// 12V Motorcycle Battery Removal / Power-Cut Tamper State (GPIO 34)
-bool  batteryTamperArmed         = false; // Auto-arms once >= 8.5V bike battery is detected for 2s
-bool  batteryDisconnected        = false; // True while 12V battery is removed after being armed
-int   batPresentStreak           = 0;
-int   batMissingStreak           = 0;
-float lastExt12VVoltage          = 0.0f;
-float lastBackup18650Voltage     = 3.9f;
-unsigned long lastBatCheckMs     = 0;
-
-const unsigned long BAT_CHECK_INTERVAL_MS = 100;   // Check 12V rail every 100ms (10 Hz)
-const float BAT_CONNECTED_MIN_V           = 8.5f;  // >= 8.5V confirms connected to 12V bike battery
-const float BAT_REMOVED_THRESHOLD_V       = 5.5f;  // < 5.5V indicates 12V battery removed / wire cut (ignores starter crank dips)
-const int   BAT_ARM_SAMPLES               = 20;    // 20 * 100ms = 2.0s continuous 12V presence to arm
-const int   BAT_CUT_DEBOUNCE_SAMPLES      = 6;     // 6 * 100ms = 600ms continuous 0V drop to trigger alert
+// Deferred Internet OTA State (LILYGO T-SIM7000G)
+bool   pendingOtaExecution = false;
+String pendingOtaUrl       = "";
+String pendingOtaVersion   = "";
+String pendingOtaMd5       = "";
+bool   pendingOtaForce     = false;
 
 // Forward Declarations
 String sendAT(const String& cmd, uint32_t timeoutMs = 1200);
 void checkModemURC();
 void handleUrcLine(const String& line);
 String getCsvField(const String& csv, int targetIndex);
+String extractJsonField(const String& json, const char* key);
 bool initSim7000G();
 bool connectCellularMqtt();
 bool sim7000PublishMqtt(const String& topic, const String& payload);
 bool sendDirectSimSms(const String& smsBody, const char* label);
 bool sendGeofenceSmsAlert(double lat, double lng, double distMeters, float speedKmh, bool isTest = false);
 bool sendTamperSmsAlert(float gForce, int piezoAdcDelta, const char* sourceName);
-bool sendBatteryCutSmsAlert(float backupVolts);
 void triggerLocalAlarm();
 void manageLocalAlarm();
 void handleIncomingSmsCommand(const String& sender, const String& smsText);
-void placeTamperVoiceCall(const char* reason, bool bypassCooldown = false);
+void placeTamperVoiceCall(const char* reason);
 void manageActiveVoiceCall();
 double calculateHaversineMeters(double lat1, double lon1, double lat2, double lon2);
 void checkGeofencePerimeter();
 void applyGeofenceCommand(const String& spec);
 void updateGnssAndSignal();
 void publishTelemetryPayload();
-float readExternal12VVoltage();
-float readOnboard18650Voltage();
-void checkBatteryRemovalTamper();
-void triggerBatteryRemovalAlert(float backupVolts);
 int readFilteredPiezoADC();
 void calibratePiezoSensor();
-void calibrateMpuSensor();
-void updateMpuMotionState();
 void checkPiezoVibrationSensor();
+void checkTamperSensor();
 void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName);
-void setImmobilizerRelay(bool cutEngine);
 void onMqttCommandReceived(char* topic, byte* payload, unsigned int length);
 void sendAck(String action, String status);
+void executeLilygoInternetOta(const String& url, const String& targetVer, const String& expectedMd5);
+bool runLilygoWifiHttpOta(const String& url, const String& expectedMd5);
+bool runSim7000CellularHttpOta(const String& url, const String& expectedMd5);
+String deriveChipImeiFromMac();
+void loadIdentityFromNvs();
+void refreshMqttTopics();
+void normalizeAndSavePhoneNvs(const String& rawPhone);
+bool isAuthorizedOwnerSender(const String& sender);
+void printIdentityCard();
+void manageSmartSleepMode();
+void enterSmartSleepMode();
+void exitSmartSleepMode(const char* wakeReason);
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Load Permanent NVS Identity + Derive Unique 15-Digit ESP32 Chip ID Fallback
+  loadIdentityFromNvs();
+  lastMotionOrVibMs = millis();
+
   Serial.println("=================================================");
   Serial.println("ISBAT UNIVERSITY - BODA-BODA TELEMATICS SYSTEM");
-  Serial.println("Single Board  : LILYGO T-SIM7000G (3D GPS + MQTT + SMS + Call)");
-  Serial.println("Alert Contact : " + String(ALERT_PHONE_INTL) + " (SMS + Owner Voice Call)");
+  Serial.println("Single Board  : LILYGO T-SIM7000G (3D GPS + MQTT + SMS + Call + NVS)");
   Serial.println("=================================================");
 
   // Configure Onboard Blue LED (Active LOW on T-SIM7000G: LOW = Ignition ON, HIGH = Cut)
   pinMode(PIN_BLUE_LED, OUTPUT);
   digitalWrite(PIN_BLUE_LED, LOW);
 
-  // Configure Offline Local Alarm Buzzer/Siren Pin (GPIO 14) & 2-Way Relay Channel 1 (IN1 -> GPIO 23)
+  // Configure Offline Local Alarm Buzzer/Siren Pin (GPIO 14) & Immobilizer Relay (GPIO 23)
   pinMode(PIN_ALARM_BUZZER, OUTPUT);
   digitalWrite(PIN_ALARM_BUZZER, LOW);
-  setImmobilizerRelay(false); // Normal Riding State: Channel 1 Coil OFF (COM1 <-> NC1 closed)
+  pinMode(PIN_RELAY_IMMOBILIZER, OUTPUT);
+  digitalWrite(PIN_RELAY_IMMOBILIZER, LOW);
 
   // Configure Battery & Analog Piezo Vibration ADCs
   pinMode(PIN_BATTERY_ADC, INPUT);
   pinMode(PIN_ONBOARD_BAT_ADC, INPUT);
   pinMode(PIN_PIEZO_VIBRATION, INPUT);
-  analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
-  analogSetPinAttenuation(PIN_ONBOARD_BAT_ADC, ADC_11db);
   analogSetPinAttenuation(PIN_PIEZO_VIBRATION, ADC_11db);
 
-  // Sample initial 12V & 18650 voltages at startup
-  lastExt12VVoltage = readExternal12VVoltage();
-  lastBackup18650Voltage = readOnboard18650Voltage();
-  Serial.println("[POWER] External 12V Input (GPIO 34): " + String(lastExt12VVoltage, 2) +
-                 "V | Backup 18650 (GPIO 35): " + String(lastBackup18650Voltage, 2) + "V");
-
-  // Initialize Integrated SIM7000G Modem & GNSS Engine (UART1: RX=26, TX=27)
+  // Initialize Integrated SIM7000G Modem & GNSS Engine (auto-reads physical AT+GSN IMEI!)
   modemReady = initSim7000G();
-
-  // Initialize MQTT Topics
-  TOPIC_TELEMETRY  = "boda/" + deviceImei + "/telemetry";
-  TOPIC_COMMAND    = "boda/" + deviceImei + "/command";
-  TOPIC_COMMAND_HW = "boda/" + hardwareImei + "/command";
-  TOPIC_ACK        = "boda/" + deviceImei + "/ack";
-  TOPIC_TAMPER     = "boda/" + deviceImei + "/tamper";
-
-  Serial.println("[+] Provisioned Node ID : " + deviceImei);
-  Serial.println("[+] Physical Modem IMEI : " + hardwareImei);
+  refreshMqttTopics();
+  printIdentityCard();
 
   // Bring up MTN Uganda GPRS bearer & Native SIM7000G MQTT client
   if (modemReady) {
@@ -256,50 +243,65 @@ void setup() {
   delay(250);
   calibratePiezoSensor();
 
-  // Initialize MPU6050 6-Axis IMU (I2C: SDA=21, SCL=22) to gate Piezo tamper alerts during motion
-  Wire.begin(PIN_MPU_SDA, PIN_MPU_SCL);
-  Wire.setClock(400000); // 400 kHz Fast-Mode I2C keeps reads < 0.4ms
-  if (mpu.begin(0x68, &Wire) || mpu.begin(0x69, &Wire)) {
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    mpuAvailable = true;
-    calibrateMpuSensor();
-    Serial.println("[+] MPU6050 initialized (SDA=21, SCL=22) — Motion-gating ARMED (mutes tamper when riding).");
-  } else {
+  // Initialize Optional MPU6050 Accelerometer (I2C: SDA=21, SCL=22)
+  if (!mpu.begin()) {
+    Serial.println("[i] Optional MPU6050 not attached (Active Tamper Sensor: Analog Piezo on GPIO 32).");
     mpuAvailable = false;
-    Serial.println("[!] MPU6050 not detected on SDA=21 / SCL=22! Check 3V3, GND, SDA, SCL wiring.");
+  } else {
+    Serial.println("[+] MPU6050 accelerometer initialized.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpuAvailable = true;
   }
 
   Serial.println("[+] Hardware initialization complete.");
-  Serial.println("[INFO] Commands: ENGINE_CUT | ENGINE_RESTORE | TEST_RELAY | RELAY_INVERT | MPU_STATUS | BAT_STATUS | TEST_BAT_CUT | TEST_TAMPER | TEST_SMS | TEST_CALL | GEOFENCE_SET:lat,lng,rad");
+  Serial.println("[+] Board Profile: " + String(BOARD_TYPE) + " | Firmware: v" + String(FIRMWARE_VERSION));
+
+  if (strlen(WIFI_OTA_SSID) > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_OTA_SSID, WIFI_OTA_PASS);
+    unsigned long wf0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wf0 < 4000) delay(200);
+  }
+
+  sendAck("BOOT_READY", "ONLINE_V" + String(FIRMWARE_VERSION));
+  Serial.println("[INFO] Commands: WHOAMI | SLEEP_NOW | WAKE_NOW | SET_IMEI:<15d> | CLEAR_IMEI | SET_PHONE:<num> | SET_PLATE:<plt> | ENGINE_CUT | ENGINE_RESTORE");
 }
 
 void loop() {
-  // 1. Sample MPU6050 Motion-Gating State (20 Hz non-blocking) BEFORE Piezo evaluation
-  updateMpuMotionState();
-
-  // 2. High-speed Analog Piezoelectric Ceramic Vibration/Shock Sampling (GPIO 32)
-  //    (Automatically muted while bikeInMotion == true)
+  // 1. High-speed Analog Piezoelectric Ceramic Vibration/Shock Sampling (GPIO 32)
+  //    Senses even gentle vibrations to immediately wake the board from Smart Sleep!
   checkPiezoVibrationSensor();
 
-  // 3. Monitor External 12V Motorcycle Battery Rail (GPIO 34) for Removal / Wire-Cut Tamper
-  //    (NEVER muted by motion — always sends SMS & calls owner if 12V battery is removed!)
-  checkBatteryRemovalTamper();
-
-  // 4. Non-blocking Offline Local Alarm Buzzer & LED Strobe Timer
+  // 2. Non-blocking Offline Local Alarm Buzzer & LED Strobe Timer
   manageLocalAlarm();
   manageActiveVoiceCall();
 
-  // 5. Poll asynchronous SIM7000G URCs (incoming cellular MQTT commands +SMSUB & SMS)
+  // 3. Poll asynchronous SIM7000G URCs (incoming cellular MQTT commands +SMSUB / SMS)
   if (modemReady) {
     checkModemURC();
   }
 
-  // 6. Periodic GNSS Poll, Marked Perimeter Check & Telemetry Transmission
-  if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL) {
+  // 3B. Execute Deferred Internet OTA Firmware Update Safely
+  if (pendingOtaExecution) {
+    if (isPowerSaveSleep) exitSmartSleepMode("OTA_UPDATE");
+    pendingOtaExecution = false;
+    executeLilygoInternetOta(pendingOtaUrl, pendingOtaVersion, pendingOtaMd5);
+  }
+
+  // 4. Sample optional MPU6050 Accelerometer if connected
+  if (mpuAvailable) {
+    checkTamperSensor();
+  }
+
+  // 4B. Manage Smart Stationary Sleep Mode & Motion Keep-Awake
+  manageSmartSleepMode();
+
+  // 5. Periodic GNSS Poll, Marked Perimeter Check & Telemetry Transmission
+  //    (3s cadence while awake/moving; 60s low-power heartbeat while in Smart Sleep)
+  unsigned long activeInterval = isPowerSaveSleep ? SLEEP_HEARTBEAT_INTERVAL_MS : TELEMETRY_INTERVAL;
+  if (millis() - lastTelemetryTime >= activeInterval) {
     lastTelemetryTime = millis();
-    if (modemReady) {
+    if (modemReady && !isPowerSaveSleep) {
       updateGnssAndSignal();
       checkGeofencePerimeter();
 
@@ -311,51 +313,35 @@ void loop() {
     publishTelemetryPayload();
   }
 
-  // 7. USB-Serial Command Interface (Node.js Serial Gateway & Interactive Testing)
+  // 6. USB-Serial Command Interface (Node.js Serial Gateway & Interactive Testing)
   if (Serial.available() > 0) {
     String serialCmd = Serial.readStringUntil('\n');
     serialCmd.trim();
     if (serialCmd.equalsIgnoreCase("TEST_SMS")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("SERIAL_CMD");
       sendGeofenceSmsAlert(gnss.latitude, gnss.longitude, 0.0, gnss.speedKmh, true);
     } else if (serialCmd.equalsIgnoreCase("TEST_TAMPER")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("TEST_TAMPER");
       lastVoiceCallMs = 0;
       lastTamperSmsMs = 0;
       triggerTamperAlert(4.8f, 320, "TEST_TAMPER");
-    } else if (serialCmd.equalsIgnoreCase("TEST_BAT_CUT")) {
-      lastVoiceCallMs = 0;
-      lastTamperSmsMs = 0;
-      triggerBatteryRemovalAlert(readOnboard18650Voltage());
     } else if (serialCmd.equalsIgnoreCase("TEST_CALL")) {
+      if (isPowerSaveSleep) exitSmartSleepMode("TEST_CALL");
       lastVoiceCallMs = 0;
-      placeTamperVoiceCall("MANUAL_TEST_CALL", true);
-    } else if (serialCmd.equalsIgnoreCase("TEST_RELAY")) {
-      Serial.println("[RELAY CH1] Clicking Channel 1 (IN1 -> GPIO 23) ON (Engine Cut) for 1.5s...");
-      setImmobilizerRelay(true);
-      delay(1500);
-      setImmobilizerRelay(isImmobilized);
-      Serial.println("[RELAY CH1] Channel 1 test complete.");
-    } else if (serialCmd.equalsIgnoreCase("RELAY_INVERT")) {
-      relayActiveLow = !relayActiveLow;
-      setImmobilizerRelay(isImmobilized);
-      Serial.println("[RELAY CH1] Polarity switched -> " + String(relayActiveLow ? "ACTIVE-LOW (Standard 2-Way Board)" : "ACTIVE-HIGH"));
-    } else if (serialCmd.equalsIgnoreCase("MPU_STATUS")) {
-      Serial.println("[MPU6050] Attached: " + String(mpuAvailable ? "YES" : "NO") +
-                     " | State: " + String(bikeInMotion ? "IN MOTION (TAMPER MUTED)" : "PARKED (TAMPER ARMED)") +
-                     " | Score: " + String(mpuMotionScore) + "/" + String(MOTION_ENTER_SCORE) +
-                     " | DynAcc: " + String(lastMpuDynAccG, 3) + "G" +
-                     " | Gyro: " + String(lastMpuGyroRad, 3) + " rad/s");
-    } else if (serialCmd.equalsIgnoreCase("BAT_STATUS")) {
-      Serial.println("[12V GUARD] Ext12V (GPIO 34): " + String(lastExt12VVoltage, 2) + "V" +
-                     " | Backup18650 (GPIO 35): " + String(lastBackup18650Voltage, 2) + "V" +
-                     " | Armed: " + String(batteryTamperArmed ? "YES" : "NO (waiting for >=8.5V)") +
-                     " | CutState: " + String(batteryDisconnected ? "DISCONNECTED!" : "NORMAL"));
+      placeTamperVoiceCall("MANUAL_TEST_CALL");
+    } else if (serialCmd.equalsIgnoreCase("SLEEP_NOW")) {
+      enterSmartSleepMode();
+    } else if (serialCmd.equalsIgnoreCase("WAKE_NOW")) {
+      exitSmartSleepMode("MANUAL_WAKE");
+    } else if (serialCmd.equalsIgnoreCase("WHOAMI")) {
+      printIdentityCard();
     } else if (serialCmd.startsWith("GEOFENCE_SET:")) {
       applyGeofenceCommand(serialCmd.substring(13));
     } else if (serialCmd.startsWith("AT") || serialCmd.startsWith("at")) {
       String r = sendAT(serialCmd, 2000);
       Serial.println("[MODEM] " + r);
     } else if (serialCmd.length() > 0) {
-      byte dummyBuf[192];
+      byte dummyBuf[256];
       unsigned int len = min((unsigned int)serialCmd.length(), (unsigned int)(sizeof(dummyBuf) - 1));
       memcpy(dummyBuf, serialCmd.c_str(), len);
       onMqttCommandReceived((char*)"serial/gateway", dummyBuf, len);
@@ -364,163 +350,33 @@ void loop() {
 }
 
 /**
- * Reads external 12V motorcycle battery voltage via GPIO 34 divider (R1=100k, R2=22k)
- * Uses median-of-3 filtering and re-primes GPIO 32 SAR cap afterward
+ * Places an Emergency Voice Call to registered owner phone using the onboard SIM7000G
  */
-float readExternal12VVoltage() {
-  int a = analogRead(PIN_BATTERY_ADC);
-  int b = analogRead(PIN_BATTERY_ADC);
-  int c = analogRead(PIN_BATTERY_ADC);
-  int lo = min(a, min(b, c));
-  int hi = max(a, max(b, c));
-  int med = (a + b + c) - lo - hi;
-  (void)analogRead(PIN_PIEZO_VIBRATION); // Re-prime shared ADC1 S&H cap onto Piezo pin
-  return (med / 4095.0f) * 3.3f * ((100.0f + 22.0f) / 22.0f);
-}
-
-/**
- * Reads LILYGO T-SIM7000G onboard 18650 backup battery voltage via GPIO 35 internal divider
- */
-float readOnboard18650Voltage() {
-  int raw = analogRead(PIN_ONBOARD_BAT_ADC);
-  (void)analogRead(PIN_PIEZO_VIBRATION);
-  float v = (raw / 4095.0f) * 3.3f * 2.0f * 1.1f;
-  return (v > 2.0f) ? v : 3.9f;
-}
-
-/**
- * Monitors external 12V motorcycle battery on GPIO 34 at 10 Hz:
- * - Automatically ARMS once installed on bike (>= 8.5V present for 2.0s)
- * - Fires instant SMS + Owner Voice Call if 12V drops below 5.5V for >= 600ms
- * - Re-arms automatically when 12V battery is reconnected
- */
-void checkBatteryRemovalTamper() {
-  unsigned long now = millis();
-  if (now - lastBatCheckMs < BAT_CHECK_INTERVAL_MS) {
-    return;
-  }
-  lastBatCheckMs = now;
-
-  // Skip ADC sampling during active GSM RF burst to avoid 2G TDMA ripple
-  if (now - lastModemRfActivityMs < 150) {
-    return;
-  }
-
-  float extV = readExternal12VVoltage();
-  lastExt12VVoltage = extV;
-  lastBackup18650Voltage = readOnboard18650Voltage();
-
-  if (extV >= BAT_CONNECTED_MIN_V) {
-    batMissingStreak = 0;
-    if (batPresentStreak < BAT_ARM_SAMPLES) {
-      batPresentStreak++;
-    }
-
-    if (!batteryTamperArmed && batPresentStreak >= BAT_ARM_SAMPLES) {
-      batteryTamperArmed = true;
-      batteryDisconnected = false;
-      Serial.println("[12V GUARD] 🔋 12V Motorcycle Battery detected (" + String(extV, 2) +
-                     "V) — Battery Removal Tamper ARMED!");
-    } else if (batteryDisconnected && batPresentStreak >= BAT_ARM_SAMPLES) {
-      batteryDisconnected = false;
-      Serial.println("[12V GUARD] ✅ 12V Motorcycle Battery reconnected (" + String(extV, 2) +
-                     "V) — Battery Removal Guard RE-ARMED.");
-    }
-  } else if (extV < BAT_REMOVED_THRESHOLD_V) {
-    batPresentStreak = 0;
-    if (batteryTamperArmed && !batteryDisconnected) {
-      batMissingStreak++;
-      if (batMissingStreak >= BAT_CUT_DEBOUNCE_SAMPLES) {
-        batteryDisconnected = true;
-        batMissingStreak = 0;
-        triggerBatteryRemovalAlert(lastBackup18650Voltage);
-      }
-    }
-  }
-}
-
-/**
- * Sends Urgent Offline GSM SMS when 12V Motorcycle Battery is removed / power wire cut
- */
-bool sendBatteryCutSmsAlert(float backupVolts) {
-  String smsBody = "[BODA POWER CUT " + String(BIKE_PLATE) + "]\n";
-  smsBody += "CRITICAL: 12V BIKE BATTERY REMOVED!\n";
-  smsBody += "Tracker on backup cell (" + String(backupVolts, 1) + "V).\n";
-  smsBody += String(isImmobilized ? "Engine: LOCKED\n" : "Reply STOP to lock engine\n");
-  smsBody += "https://maps.google.com/?q=" + String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
-  return sendDirectSimSms(smsBody, "12V Battery Removal");
-}
-
-/**
- * Full Emergency Response on 12V Battery Removal:
- *   1. Local 10s Siren + Strobe
- *   2. Direct SIM7000G SMS to +256748802162
- *   3. Cellular MQTT + Serial Alert (triggers Cloud Voice Call & Portal Critical Banner)
- *   4. Direct SIM7000G GSM Voice Call to Owner (0748802162)
- */
-void triggerBatteryRemovalAlert(float backupVolts) {
-  Serial.println("[!] 🚨 CRITICAL TAMPER: 12V MOTORCYCLE BATTERY REMOVED / WIRE CUT! Running on 18650 backup (" +
-                 String(backupVolts, 2) + "V)!");
-
-  // 1. Sound local offline buzzer & flash Blue LED strobe immediately
-  triggerLocalAlarm();
-
-  // 2. Build JSON alert packet for Serial Gateway & Cellular MQTT (triggers Cloud Voice Call too)
-  String cutPayload = "{";
-  cutPayload += "\"device_imei\":\"" + deviceImei + "\",";
-  cutPayload += "\"hardware_imei\":\"" + hardwareImei + "\",";
-  cutPayload += "\"event_type\":\"BATTERY_DISCONNECTED\",";
-  cutPayload += "\"sensor\":\"BATTERY_12V_CUT\",";
-  cutPayload += "\"ext_voltage\":" + String(lastExt12VVoltage, 2) + ",";
-  cutPayload += "\"backup_voltage\":" + String(backupVolts, 2) + ",";
-  cutPayload += "\"latitude\":" + String(gnss.latitude, 6) + ",";
-  cutPayload += "\"longitude\":" + String(gnss.longitude, 6) + ",";
-  cutPayload += "\"alert_phone\":\"" + String(ALERT_PHONE_LOCAL) + "\",";
-  cutPayload += "\"timestamp\":" + String(millis());
-  cutPayload += "}";
-
-  Serial.println("[MQTT TAMPER -> " + TOPIC_TAMPER + "]: " + cutPayload);
-
-  // 3. Send Direct Offline GSM SMS to Owner FIRST while 2G radio channel is clear
-  sendBatteryCutSmsAlert(backupVolts);
-
-  // 4. Publish over MTN Uganda Cellular MQTT (triggers Cloud Voice Gateway & Live Portal Alert)
-  sim7000PublishMqtt(TOPIC_TAMPER, cutPayload);
-
-  // 5. Dial Owner directly on SIM7000G (ATD0748802162;) bypassing normal vibration call cooldown
-  delay(400);
-  placeTamperVoiceCall("12V_BATTERY_REMOVED", true);
-}
-
-/**
- * Places an Emergency Voice Call to 0748802162 using the onboard SIM7000G
- * (Attempts direct ATD0748802162; on SIM7000G + triggers Cloud Voice Gateway over SIM7000G Data)
- */
-void placeTamperVoiceCall(const char* reason, bool bypassCooldown) {
+void placeTamperVoiceCall(const char* reason) {
   if (!modemReady) return;
   if (voiceCallActive) {
-    Serial.println("[CALL] Voice call to " + String(ALERT_PHONE_LOCAL) + " already active.");
+    Serial.println("[CALL] Voice call to " + alertPhoneLocal + " already active.");
     return;
   }
-  if (!bypassCooldown && lastVoiceCallMs != 0 && (millis() - lastVoiceCallMs < CALL_COOLDOWN_MS)) {
+  if (lastVoiceCallMs != 0 && (millis() - lastVoiceCallMs < CALL_COOLDOWN_MS)) {
     Serial.println("[CALL] Voice call cooldown active (preventing redial spam).");
     return;
   }
 
   lastModemRfActivityMs = millis();
   lastVoiceCallMs = millis();
-  Serial.println("[CALL] 📞 Dialing " + String(ALERT_PHONE_LOCAL) + " on SIM7000G — Reason: " + String(reason));
+  Serial.println("[CALL] 📞 Dialing " + alertPhoneLocal + " on SIM7000G — Reason: " + String(reason));
 
   sendAT("AT+CVHU=0", 500);
-  String dialResp = sendAT("ATD" + String(ALERT_PHONE_LOCAL) + ";", 2000);
+  String dialResp = sendAT("ATD" + alertPhoneLocal + ";", 2000);
   lastModemRfActivityMs = millis();
 
   if (dialResp.indexOf("OK") >= 0) {
     voiceCallActive = true;
     voiceCallStartMs = millis();
-    Serial.println("[+] 📞 SIM7000G RINGING " + String(ALERT_PHONE_LOCAL) + " (auto-hangup in 25s)...");
+    Serial.println("[+] 📞 SIM7000G RINGING " + alertPhoneLocal + " (auto-hangup in 25s)...");
   } else {
-    Serial.println("[CALL] 📡 SIM7000G (MDM9206) routed Call trigger over MTN Data -> Backend Voice Gateway (" + String(ALERT_PHONE_INTL) + ").");
+    Serial.println("[CALL] 📡 SIM7000G (MDM9206) routed Tamper Call trigger over MTN Data -> Backend Voice Gateway (" + alertPhoneIntl + ").");
   }
 }
 
@@ -578,7 +434,7 @@ void manageLocalAlarm() {
 bool sendDirectSimSms(const String& smsBody, const char* label) {
   if (!modemReady) return false;
 
-  Serial.println("[SMS] 📩 Sending Offline " + String(label) + " SMS via SIM7000G to " + String(ALERT_PHONE_INTL) + "...");
+  Serial.println("[SMS] 📩 Sending Offline " + String(label) + " SMS via SIM7000G to " + alertPhoneIntl + "...");
   lastModemRfActivityMs = millis();
 
   // Essential MTN Uganda GSM SMS settings (prevents +CMS ERROR: 500)
@@ -590,7 +446,7 @@ bool sendDirectSimSms(const String& smsBody, const char* label) {
   while (SerialModem.available()) {
     SerialModem.read();
   }
-  SerialModem.print("AT+CMGS=\"" + String(ALERT_PHONE_INTL) + "\"\r");
+  SerialModem.print("AT+CMGS=\"" + alertPhoneIntl + "\"\r");
 
   // Wait up to 4s for '>' prompt
   unsigned long start = millis();
@@ -626,7 +482,7 @@ bool sendDirectSimSms(const String& smsBody, const char* label) {
     }
     if (smsResp.indexOf("+CMGS:") >= 0 || smsResp.indexOf("\r\nOK\r\n") >= 0) {
       lastModemRfActivityMs = millis();
-      Serial.println("[+] ✅ Offline " + String(label) + " SMS delivered to MTN network for " + String(ALERT_PHONE_INTL) + "!");
+      Serial.println("[+] ✅ Offline " + String(label) + " SMS delivered to MTN network for " + alertPhoneIntl + "!");
       return true;
     }
     if (smsResp.indexOf("ERROR") >= 0) {
@@ -645,7 +501,7 @@ bool sendDirectSimSms(const String& smsBody, const char* label) {
  * Sends Live GPS SMS via SIM7000G (AT+CMGS) to +256748802162 every 10 mins outside perimeter
  */
 bool sendGeofenceSmsAlert(double lat, double lng, double distMeters, float speedKmh, bool isTest) {
-  String smsBody = "[BODA " + String(BIKE_PLATE) + "]\n";
+  String smsBody = "[BODA " + bikePlate + "]\n";
   if (isTest) {
     smsBody += "OFFLINE GPS SMS READY!\n";
   } else {
@@ -658,7 +514,7 @@ bool sendGeofenceSmsAlert(double lat, double lng, double distMeters, float speed
 }
 
 /**
- * Sends Instant Offline Tamper Alert SMS directly from SIM7000G MTN SIM to +256748802162
+ * Sends Instant Offline Tamper Alert SMS directly from SIM7000G MTN SIM to registered owner phone
  */
 bool sendTamperSmsAlert(float gForce, int piezoAdcDelta, const char* sourceName) {
   if (lastTamperSmsMs != 0 && (millis() - lastTamperSmsMs < TAMPER_SMS_COOLDOWN_MS)) {
@@ -667,7 +523,7 @@ bool sendTamperSmsAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   }
   lastTamperSmsMs = millis();
 
-  String smsBody = "[BODA TAMPER " + String(BIKE_PLATE) + "]\n";
+  String smsBody = "[BODA TAMPER " + bikePlate + "]\n";
   smsBody += "VIBRATION ALERT! Shock: " + String(gForce, 1) + "G\n";
   smsBody += String(isImmobilized ? "Engine: LOCKED\n" : "Reply STOP to cut engine\n");
   smsBody += "https://maps.google.com/?q=" + String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
@@ -748,7 +604,8 @@ void checkGeofencePerimeter() {
       breachPayload += "\"radius_m\":" + String(geofenceRadiusMeters, 1) + ",";
       breachPayload += "\"latitude\":" + String(gnss.latitude, 6) + ",";
       breachPayload += "\"longitude\":" + String(gnss.longitude, 6) + ",";
-      breachPayload += "\"alert_phone\":\"" + String(ALERT_PHONE_LOCAL) + "\"";
+      breachPayload += "\"plate\":\"" + bikePlate + "\",";
+      breachPayload += "\"alert_phone\":\"" + alertPhoneLocal + "\"";
       breachPayload += "}";
 
       Serial.println("[MQTT GEOFENCE -> " + TOPIC_TAMPER + "]: " + breachPayload);
@@ -792,9 +649,9 @@ void handleIncomingSmsCommand(const String& sender, const String& smsText) {
   cmd.toUpperCase();
   Serial.println("[SMS RX <- " + sender + "]: " + cmd);
 
-  // Accept offline SMS commands from owner number (0748802162 / +256748802162)
-  if (sender.length() > 0 && sender.indexOf("748802162") < 0) {
-    Serial.println("[SMS RX] Ignored SMS from unauthorized number: " + sender);
+  // Accept offline SMS commands from owner's registered phone (synced via NVS!)
+  if (!isAuthorizedOwnerSender(sender)) {
+    Serial.println("[SMS RX] Ignored SMS from unauthorized number: " + sender + " (Owner: " + alertPhoneIntl + ")");
     return;
   }
 
@@ -802,25 +659,25 @@ void handleIncomingSmsCommand(const String& sender, const String& smsText) {
     isImmobilized = true;
     localAlarmActive = false;
     digitalWrite(PIN_ALARM_BUZZER, LOW);
-    setImmobilizerRelay(true);
+    digitalWrite(PIN_RELAY_IMMOBILIZER, HIGH);
     digitalWrite(PIN_BLUE_LED, HIGH);
     sendAck("ENGINE_CUT", "EXECUTED");
-    String reply = "[BODA " + String(BIKE_PLATE) + "]\nENGINE IMMOBILIZED OFFLINE!\nhttps://maps.google.com/?q=" +
+    String reply = "[BODA " + bikePlate + "]\nENGINE IMMOBILIZED OFFLINE!\nhttps://maps.google.com/?q=" +
                    String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
     sendDirectSimSms(reply, "Immobilize Confirm");
   } else if (cmd.indexOf("START") >= 0 || cmd.indexOf("UNLOCK") >= 0 || cmd.indexOf("RESTORE") >= 0) {
     isImmobilized = false;
     localAlarmActive = false;
     digitalWrite(PIN_ALARM_BUZZER, LOW);
-    setImmobilizerRelay(false);
+    digitalWrite(PIN_RELAY_IMMOBILIZER, LOW);
     digitalWrite(PIN_BLUE_LED, LOW);
     sendAck("ENGINE_RESTORE", "EXECUTED");
-    String reply = "[BODA " + String(BIKE_PLATE) + "]\nENGINE RESTORED OFFLINE!\nhttps://maps.google.com/?q=" +
+    String reply = "[BODA " + bikePlate + "]\nENGINE RESTORED OFFLINE!\nhttps://maps.google.com/?q=" +
                    String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
     sendDirectSimSms(reply, "Restore Confirm");
   } else if (cmd.indexOf("GPS") >= 0 || cmd.indexOf("LOC") >= 0 || cmd.indexOf("STATUS") >= 0) {
-    String reply = "[BODA " + String(BIKE_PLATE) + "]\nFix: " + String(gnss.hasFix ? "3D LOCK" : "LAST KNOWN") +
-                   " | 12V: " + String(batteryDisconnected ? "CUT!" : (String(lastExt12VVoltage, 1) + "V")) +
+    String reply = "[BODA " + bikePlate + " v" + String(FIRMWARE_VERSION) + "]\nIMEI: " + deviceImei +
+                   "\nFix: " + String(gnss.hasFix ? "3D LOCK" : "LAST KNOWN") +
                    " | Spd: " + String(gnss.speedKmh, 1) + "km/h\nhttps://maps.google.com/?q=" +
                    String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
     sendDirectSimSms(reply, "Live Location");
@@ -836,6 +693,7 @@ void handleUrcLine(const String& line) {
   }
 
   if (line.startsWith("+CMT:")) {
+    if (isPowerSaveSleep) exitSmartSleepMode("INCOMING_SMS");
     int q1 = line.indexOf('"');
     int q2 = line.indexOf('"', q1 + 1);
     incomingSmsSender = (q1 >= 0 && q2 > q1) ? line.substring(q1 + 1, q2) : "";
@@ -844,6 +702,7 @@ void handleUrcLine(const String& line) {
   }
 
   if (line.startsWith("+SMSUB:")) {
+    if (isPowerSaveSleep) exitSmartSleepMode("MQTT_COMMAND");
     int firstComma = line.indexOf(',');
     if (firstComma > 0) {
       String topicPart = line.substring(7, firstComma);
@@ -975,6 +834,10 @@ bool initSim7000G() {
   gsn.trim();
   if (gsn.length() >= 14 && gsn.length() <= 16) {
     hardwareImei = gsn;
+    nvs.putString("auto_imei", hardwareImei);
+    if (!imeiCustomLocked) {
+      deviceImei = hardwareImei;
+    }
   }
 
   // Configure 2G GSM/EDGE mode (CNMP=13) & MTN Uganda Offline GSM SMS stack
@@ -1061,7 +924,8 @@ bool connectCellularMqtt() {
     if (TOPIC_COMMAND_HW != TOPIC_COMMAND) {
       sendAT("AT+SMSUB=\"" + TOPIC_COMMAND_HW + "\",1", 2000);
     }
-    Serial.println("[+] Cellular MQTT Connected & Subscribed to " + TOPIC_COMMAND);
+    sendAT("AT+SMSUB=\"boda/ota/broadcast\",1", 2000);
+    Serial.println("[+] Cellular MQTT Connected & Subscribed to " + TOPIC_COMMAND + " + boda/ota/broadcast");
     return true;
   }
 
@@ -1162,6 +1026,14 @@ void updateGnssAndSignal() {
     gnss.longitude  = lngStr.toDouble();
     gnss.speedKmh   = speedStr.length() ? speedStr.toFloat() : 0.0f;
     gnss.headingDeg = courseStr.length() ? courseStr.toFloat() : 0.0f;
+
+    // Keep board 100% awake whenever the motorcycle is in motion (speed >= 1.8 km/h)
+    if (gnss.speedKmh >= MOTION_SPEED_THRESHOLD_KMH) {
+      lastMotionOrVibMs = millis();
+      if (isPowerSaveSleep) {
+        exitSmartSleepMode("GPS_MOTION");
+      }
+    }
   } else {
     gnss.hasFix = false;
   }
@@ -1176,31 +1048,34 @@ void publishTelemetryPayload() {
 
   double lat = gnss.latitude;
   double lng = gnss.longitude;
-  float speed = hasFix ? gnss.speedKmh : 0.0f;
+  float speed = (hasFix && !isPowerSaveSleep) ? gnss.speedKmh : 0.0f;
   float heading = hasFix ? gnss.headingDeg : 0.0f;
 
-  float extVoltage = readExternal12VVoltage();
-  float onboardLiIon = readOnboard18650Voltage();
-  float batteryVoltage = extVoltage;
-
-  // Report 0.00V if 12V battery was removed after arming; otherwise report real 12V or backup voltage
-  if (batteryDisconnected) {
-    batteryVoltage = 0.0f;
-  } else if (batteryVoltage < 5.0f) {
+  int rawADC = analogRead(PIN_BATTERY_ADC);
+  float batteryVoltage = (rawADC / 4095.0f) * 3.3f * ((100.0f + 22.0f) / 22.0f);
+  if (batteryVoltage < 5.0f) {
+    int rawOnboard = analogRead(PIN_ONBOARD_BAT_ADC);
+    float onboardLiIon = (rawOnboard / 4095.0f) * 3.3f * 2.0f * 1.1f;
     batteryVoltage = (onboardLiIon > 2.5f) ? onboardLiIon : 12.6f;
   }
+  // Pre-charge shared SAR ADC1 sample-and-hold cap back onto GPIO 32
+  (void)analogRead(PIN_PIEZO_VIBRATION);
 
-  bool ignition = !isImmobilized && !batteryDisconnected;
+  bool ignition = !isImmobilized;
 
   String payload = "{";
   payload += "\"device_imei\":\"" + deviceImei + "\",";
   payload += "\"hardware_imei\":\"" + hardwareImei + "\",";
+  payload += "\"board_type\":\"" + String(BOARD_TYPE) + "\",";
+  payload += "\"fw_version\":\"" + String(FIRMWARE_VERSION) + "\",";
+  payload += "\"plate\":\"" + bikePlate + "\",";
+  payload += "\"owner_phone\":\"" + alertPhoneLocal + "\",";
+  payload += "\"power_mode\":\"" + String(isPowerSaveSleep ? "SLEEP" : "ACTIVE") + "\",";
   payload += "\"latitude\":" + String(lat, 6) + ",";
   payload += "\"longitude\":" + String(lng, 6) + ",";
   payload += "\"speed\":" + String(speed, 1) + ",";
   payload += "\"heading\":" + String(heading, 1) + ",";
   payload += "\"battery_voltage\":" + String(batteryVoltage, 2) + ",";
-  payload += "\"battery_disconnected\":" + String(batteryDisconnected ? "true" : "false") + ",";
   payload += "\"ignition_status\":" + String(ignition ? "true" : "false") + ",";
   payload += "\"is_immobilized\":" + String(isImmobilized ? "true" : "false") + ",";
   payload += "\"gsm_signal\":" + String(gnss.gsmCsq) + ",";
@@ -1208,7 +1083,15 @@ void publishTelemetryPayload() {
   payload += "\"gps_lock\":" + String(hasFix ? "true" : "false");
   payload += "}";
 
+  // Briefly wake SIM7000G DTR pin if publishing a 60s parked sleep heartbeat
+  if (isPowerSaveSleep && modemReady) {
+    digitalWrite(PIN_MODEM_DTR, LOW);
+    delay(40);
+  }
   bool sentCell = sim7000PublishMqtt(TOPIC_TELEMETRY, payload);
+  if (isPowerSaveSleep && modemReady) {
+    digitalWrite(PIN_MODEM_DTR, HIGH);
+  }
 
   Serial.println("[MQTT TX -> " + TOPIC_TELEMETRY + "]: " + payload);
   Serial.print("[GPS STATUS] Carrier: ");
@@ -1223,12 +1106,8 @@ void publishTelemetryPayload() {
   Serial.print(gnss.satellitesUsed);
   Serial.print("/");
   Serial.print(gnss.satellitesView);
-  Serial.print(" | 12V: ");
-  Serial.print(batteryDisconnected ? "CUT!" : (String(extVoltage, 1) + "V"));
   Serial.print(" | PiezoPeak: ");
   Serial.print(windowPeakPiezoDelta);
-  Serial.print(" | Motion: ");
-  Serial.print(bikeInMotion ? "MOVING(MUTED)" : "PARKED(ARMED)");
   Serial.print(" | Zone: ");
   Serial.print(isOutsidePerimeter ? "OUTSIDE!" : "OK");
   Serial.print(" | Lat: ");
@@ -1282,121 +1161,7 @@ void calibratePiezoSensor() {
 }
 
 /**
- * Calibrates resting gravity magnitude & gyroscope zero-rate offsets on MPU6050
- */
-void calibrateMpuSensor() {
-  if (!mpuAvailable) return;
-
-  const int samples = 40;
-  float sumAccG = 0.0f;
-  float sumGx = 0.0f, sumGy = 0.0f, sumGz = 0.0f;
-  int validSamples = 0;
-
-  for (int i = 0; i < samples; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    float accG = sqrtf(a.acceleration.x * a.acceleration.x +
-                       a.acceleration.y * a.acceleration.y +
-                       a.acceleration.z * a.acceleration.z) / 9.80665f;
-    if (!isnan(accG) && accG > 0.1f) {
-      sumAccG += accG;
-      sumGx += g.gyro.x;
-      sumGy += g.gyro.y;
-      sumGz += g.gyro.z;
-      validSamples++;
-    }
-    delay(5);
-  }
-
-  if (validSamples > 0) {
-    mpuGravityBaseG = sumAccG / (float)validSamples;
-    mpuGyroBiasX    = sumGx / (float)validSamples;
-    mpuGyroBiasY    = sumGy / (float)validSamples;
-    mpuGyroBiasZ    = sumGz / (float)validSamples;
-  }
-
-  Serial.println("[+] MPU6050 calibrated (GravityBase: " + String(mpuGravityBaseG, 2) +
-                 "G, GyroBias: [" + String(mpuGyroBiasX, 3) + ", " +
-                 String(mpuGyroBiasY, 3) + ", " + String(mpuGyroBiasZ, 3) + "] rad/s)");
-}
-
-/**
- * Samples MPU6050 at 20 Hz to detect sustained motorcycle motion (riding / rolling / steering)
- * and mute Piezo vibration tamper messages until the motorcycle parks again.
- */
-void updateMpuMotionState() {
-  unsigned long now = millis();
-  if (now - lastMpuSampleMs < MPU_SAMPLE_INTERVAL_MS) {
-    return;
-  }
-  lastMpuSampleMs = now;
-
-  bool gpsMoving = gnss.hasFix && (gnss.speedKmh >= 4.0f);
-  bool imuMoving = false;
-
-  if (mpuAvailable) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-
-    float accMagG = sqrtf(a.acceleration.x * a.acceleration.x +
-                          a.acceleration.y * a.acceleration.y +
-                          a.acceleration.z * a.acceleration.z) / 9.80665f;
-
-    float gx = g.gyro.x - mpuGyroBiasX;
-    float gy = g.gyro.y - mpuGyroBiasY;
-    float gz = g.gyro.z - mpuGyroBiasZ;
-    float gyroMagRad = sqrtf(gx * gx + gy * gy + gz * gz);
-
-    if (!isnan(accMagG) && !isnan(gyroMagRad) && accMagG > 0.05f) {
-      float dynAccG = fabsf(accMagG - mpuGravityBaseG);
-      lastMpuDynAccG = dynAccG;
-      lastMpuGyroRad = gyroMagRad;
-
-      // Slowly track resting gravity & gyro thermal drift only when completely still
-      if (dynAccG < 0.04f && gyroMagRad < 0.05f) {
-        mpuGravityBaseG = (0.99f * mpuGravityBaseG) + (0.01f * accMagG);
-        mpuGyroBiasX    = (0.995f * mpuGyroBiasX) + (0.005f * g.gyro.x);
-        mpuGyroBiasY    = (0.995f * mpuGyroBiasY) + (0.005f * g.gyro.y);
-        mpuGyroBiasZ    = (0.995f * mpuGyroBiasZ) + (0.005f * g.gyro.z);
-      }
-
-      imuMoving = (dynAccG >= MOTION_ACC_THRESHOLD_G) || (gyroMagRad >= MOTION_GYRO_THRESHOLD_RAD);
-    }
-  }
-
-  if (imuMoving || gpsMoving) {
-    mpuMotionScore = min(MOTION_SCORE_MAX, mpuMotionScore + 2);
-  } else {
-    mpuMotionScore = max(0, mpuMotionScore - 1);
-  }
-
-  if (!bikeInMotion) {
-    if (mpuMotionScore >= MOTION_ENTER_SCORE || gpsMoving) {
-      bikeInMotion = true;
-      lastMotionActiveMs = now;
-
-      // Silence local siren if rider just mounted & started riding away (keep alarm if 12V battery cut!)
-      if (localAlarmActive && !isImmobilized && !batteryDisconnected) {
-        localAlarmActive = false;
-        digitalWrite(PIN_ALARM_BUZZER, LOW);
-        digitalWrite(PIN_BLUE_LED, LOW);
-      }
-      Serial.println("[MPU6050] 🏍️ Bike IN MOTION — Piezo vibration tamper messages MUTED.");
-    }
-  } else {
-    if (imuMoving || gpsMoving || mpuMotionScore >= (MOTION_ENTER_SCORE / 2)) {
-      lastMotionActiveMs = now;
-    } else if ((now - lastMotionActiveMs >= MOTION_HOLD_MS) && (mpuMotionScore == 0)) {
-      bikeInMotion = false;
-      lastTamperAlertMs = now;
-      Serial.println("[MPU6050] 🅿️ Bike PARKED / STILL — Piezo vibration tamper alerts ARMED.");
-    }
-  }
-}
-
-/**
- * High-speed AC-coupled peak detector for Analog Piezoelectric Ceramic Sensor (GPIO 32).
- * Continues tracking DC baseline at all times, but suppresses tamper alerts when bikeInMotion == true.
+ * High-speed AC-coupled peak detector for Analog Piezoelectric Ceramic Sensor (GPIO 32)
  */
 void checkPiezoVibrationSensor() {
   if (millis() - lastModemRfActivityMs < 200) {
@@ -1418,14 +1183,14 @@ void checkPiezoVibrationSensor() {
     piezoBaseline = (0.9995f * piezoBaseline) + (0.0005f * (float)filteredRaw);
   }
 
-  // Gate Piezo tamper reaction: do NOT send tamper messages when MPU6050 detects bike motion
-  if (bikeInMotion) {
-    if (delta >= piezoTamperThreshold && (millis() - lastMutedVibrationLogMs >= 5000)) {
-      lastMutedVibrationLogMs = millis();
-      Serial.println("[MPU6050 GATE] 🔇 Ignored Piezo vibration (ADC delta: " + String(delta) +
-                     ") — motorcycle is in motion.");
+  // Sensitive Vibration Wake Detector: Even light frame/engine vibration keeps the bike awake
+  // or immediately wakes it from Stationary Smart Sleep Mode (< 2ms)!
+  int vibWakeThreshold = max(25, (piezoNoisePeak * 2) + 12);
+  if (delta >= vibWakeThreshold) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("PIEZO_VIBRATION");
     }
-    return;
   }
 
   if (delta >= piezoTamperThreshold && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
@@ -1444,7 +1209,113 @@ void checkPiezoVibrationSensor() {
 }
 
 /**
- * Triggers 100% Offline Local Siren/Strobe + Direct MTN SIM Tamper SMS + Owner Voice Call
+ * Checks for physical tamper / movement shocks using optional MPU6050
+ */
+void checkTamperSensor() {
+  if (!mpuAvailable) return;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  float totalAcc = sqrt(a.acceleration.x * a.acceleration.x +
+                        a.acceleration.y * a.acceleration.y +
+                        a.acceleration.z * a.acceleration.z) / 9.80665;
+
+  float deltaG = abs(totalAcc - previousGForce);
+  previousGForce = totalAcc;
+
+  // Wake from Smart Sleep on any motorcycle tilt or movement (>= 0.18G)
+  if (deltaG >= 0.18f) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("MPU6050_MOTION");
+    }
+  }
+
+  if (deltaG > TAMPER_THRESHOLD_G && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
+    lastTamperAlertMs = millis();
+    triggerTamperAlert(deltaG, 0, "MPU6050");
+  }
+}
+
+/**
+ * Smart Motion & Vibration-Wake Battery Saver Engine:
+ *   - Stays 100% awake when motorcycle is in motion (speed >= 1.8 km/h) or vibrating.
+ *   - Enters low-power sleep after 3 minutes of zero motion & zero vibration.
+ *   - Immediately wakes (< 2ms) the instant vibration (GPIO 32 / MPU6050), motion, or a command is sensed.
+ */
+void manageSmartSleepMode() {
+  // Always stay awake if moving, ringing alarm, on a voice call, or running OTA
+  if (gnss.hasFix && gnss.speedKmh >= MOTION_SPEED_THRESHOLD_KMH) {
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("GPS_MOTION");
+    }
+    return;
+  }
+
+  if (localAlarmActive || voiceCallActive || pendingOtaExecution) {
+    lastMotionOrVibMs = millis();
+    return;
+  }
+
+  if (!isPowerSaveSleep && (millis() - lastMotionOrVibMs >= STATIONARY_SLEEP_TIMEOUT_MS)) {
+    enterSmartSleepMode();
+  }
+}
+
+void enterSmartSleepMode() {
+  if (isPowerSaveSleep) return;
+  isPowerSaveSleep = true;
+
+  Serial.println("[SLEEP MODE] 🌙 Motorcycle stationary for 3 mins (0 vibration, 0 motion) -> Entering Smart Battery-Saver Sleep...");
+  sendAck("POWER_MODE", "SLEEP_STATIONARY_BATTERY_SAVER");
+
+  if (modemReady) {
+    // Pause high-current GPS/GNSS engine & active antenna while parked still (~45mA saved)
+    sendAT("AT+CGNSPWR=0", 1000);
+    sendAT("AT+SGPIO=0,4,1,0", 800);
+    gnssEnabled = false;
+
+    // Enable SIM7000G DTR Clock Sleep (DTR HIGH = Modem Sleep < 2mA, still wakes on SMS/Call/MQTT)
+    sendAT("AT+CSCLK=1", 800);
+    digitalWrite(PIN_MODEM_DTR, HIGH);
+  }
+
+  // Scale ESP32 CPU down to 80 MHz while keeping Piezo Vibration ADC (GPIO 32) active!
+  setCpuFrequencyMhz(80);
+}
+
+void exitSmartSleepMode(const char* wakeReason) {
+  lastMotionOrVibMs = millis();
+  if (!isPowerSaveSleep) return;
+  isPowerSaveSleep = false;
+
+  // Restore full 240 MHz ESP32 CPU speed immediately (< 1ms)
+  setCpuFrequencyMhz(240);
+
+  Serial.println("[WAKE UP] ⚡ Waking from Smart Sleep — Reason: " + String(wakeReason));
+
+  if (modemReady) {
+    // Pull DTR LOW to wake SIM7000G UART immediately
+    digitalWrite(PIN_MODEM_DTR, LOW);
+    delay(40);
+    sendAT("AT+CSCLK=0", 800);
+
+    // Re-enable Active GPS Antenna & Multi-Constellation GNSS Engine for 3s live tracking
+    sendAT("AT+SGPIO=0,4,1,1", 800);
+    sendAT("AT+CGPIO=0,48,1,1", 800);
+    if (sendAT("AT+CGNSPWR=1", 1200).indexOf("OK") >= 0) {
+      gnssEnabled = true;
+    }
+  }
+
+  sendAck("POWER_MODE", "AWAKE_" + String(wakeReason));
+  lastTelemetryTime = 0; // Force immediate telemetry transmission
+}
+
+/**
+ * Triggers 100% Offline Local Siren/Strobe + Direct MTN SIM Tamper SMS to +256748802162
  */
 void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName) {
   Serial.println("[!] TAMPER DETECTED (" + String(sourceName) + "): Shock " +
@@ -1460,7 +1331,8 @@ void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   tamperPayload += "\"sensor\":\"" + String(sourceName) + "\",";
   tamperPayload += "\"g_force\":" + String(gForce, 2) + ",";
   tamperPayload += "\"piezo_adc\":" + String(piezoAdcDelta) + ",";
-  tamperPayload += "\"alert_phone\":\"" + String(ALERT_PHONE_LOCAL) + "\",";
+  tamperPayload += "\"plate\":\"" + bikePlate + "\",";
+  tamperPayload += "\"alert_phone\":\"" + alertPhoneLocal + "\",";
   tamperPayload += "\"timestamp\":" + String(millis());
   tamperPayload += "}";
 
@@ -1470,30 +1342,8 @@ void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   // 3. Send Instant 100% Offline Direct Tamper SMS FIRST (before Class-B GPRS MQTT TBF burst!)
   sendTamperSmsAlert(gForce, piezoAdcDelta, sourceName);
 
-  // 4. Publish over MTN Uganda Cellular MQTT for live map sync & Cloud Voice Call
+  // 4. Then publish over MTN Uganda Cellular MQTT for optional live map sync
   sim7000PublishMqtt(TOPIC_TAMPER, tamperPayload);
-
-  // 5. Place Direct SIM7000G Tamper Call
-  placeTamperVoiceCall(sourceName, false);
-}
-
-/**
- * Drives Channel 1 (IN1 -> GPIO 23) of the 2-Way 5V Relay Module.
- * Uses Open-Drain High-Z when OFF on Active-LOW 5V relay modules so 3.3V ESP32 logic
- * shuts off the 5V optocoupler 100% cleanly (0 mA drain during normal riding).
- */
-void setImmobilizerRelay(bool cutEngine) {
-  if (relayActiveLow) {
-    if (cutEngine) {
-      pinMode(PIN_RELAY_IMMOBILIZER, OUTPUT);
-      digitalWrite(PIN_RELAY_IMMOBILIZER, LOW);  // Pull IN1 to GND -> Relay CH1 Energized (Opens COM1-NC1)
-    } else {
-      pinMode(PIN_RELAY_IMMOBILIZER, INPUT);     // High-Z Open-Drain -> Relay CH1 OFF (COM1-NC1 Closed)
-    }
-  } else {
-    pinMode(PIN_RELAY_IMMOBILIZER, OUTPUT);
-    digitalWrite(PIN_RELAY_IMMOBILIZER, cutEngine ? HIGH : LOW);
-  }
 }
 
 /**
@@ -1507,19 +1357,113 @@ void onMqttCommandReceived(char* topic, byte* payload, unsigned int length) {
 
   Serial.println("[MQTT RX <- " + String(topic) + "]: " + message);
 
+  if (message.indexOf("OTA_UPDATE") >= 0) {
+    String targetBoard = extractJsonField(message, "board");
+    if (targetBoard.length() > 0 && targetBoard != String(BOARD_TYPE)) {
+      Serial.println("[OTA] Ignoring firmware broadcast for board='" + targetBoard + "' (this MCU is '" + String(BOARD_TYPE) + "').");
+      return;
+    }
+    String url = extractJsonField(message, "url");
+    if (url.length() > 0) {
+      pendingOtaUrl       = url;
+      pendingOtaVersion   = extractJsonField(message, "version");
+      pendingOtaMd5       = extractJsonField(message, "md5");
+      pendingOtaForce     = (message.indexOf("\"force\":true") >= 0);
+      pendingOtaExecution = true;
+    }
+    return;
+  }
+
+  // Automatic Customer Sign-Up / Profile Sync ("cmd":"OWNER_SYNC") -> Saved Permanently in NVS!
+  if (message.indexOf("OWNER_SYNC") >= 0) {
+    String syncPlate = extractJsonField(message, "plate");
+    String syncPhone = extractJsonField(message, "owner_phone");
+    String syncEmail = extractJsonField(message, "owner_email");
+
+    if (syncPlate.length() >= 2) {
+      bikePlate = syncPlate;
+      bikePlate.toUpperCase();
+      nvs.putString("plate", bikePlate);
+    }
+    if (syncPhone.length() >= 7) {
+      normalizeAndSavePhoneNvs(syncPhone);
+    }
+    if (syncEmail.length() >= 3) {
+      ownerEmail = syncEmail;
+      nvs.putString("email", ownerEmail);
+    }
+    Serial.println("[NVS OWNER_SYNC] ✅ Saved Customer Profile -> Plate: " + bikePlate +
+                   " | Phone: " + alertPhoneIntl + " | Email: " + ownerEmail);
+    printIdentityCard();
+    sendAck("OWNER_SYNC", "SAVED_NVS_" + bikePlate);
+    return;
+  }
+
+  // Factory / USB / Remote NVS Provisioning Commands (SET_IMEI, CLEAR_IMEI, SET_PHONE, SET_PLATE, SET_EMAIL)
+  if (message.startsWith("SET_IMEI:")) {
+    String newImei = message.substring(9);
+    newImei.trim();
+    if (newImei.length() >= 8 && newImei.length() <= 20) {
+      deviceImei = newImei;
+      imeiCustomLocked = true;
+      nvs.putString("imei", deviceImei);
+      nvs.putBool("imei_lock", true);
+      refreshMqttTopics();
+      mqttConnected = false; // Re-subscribe under new IMEI on next cycle
+      printIdentityCard();
+      sendAck("SET_IMEI", "LOCKED_" + deviceImei);
+    }
+    return;
+  }
+  if (message.equalsIgnoreCase("CLEAR_IMEI")) {
+    imeiCustomLocked = false;
+    nvs.putBool("imei_lock", false);
+    nvs.remove("imei");
+    deviceImei = (hardwareImei.length() >= 14) ? hardwareImei : chipFallbackImei;
+    refreshMqttTopics();
+    mqttConnected = false;
+    printIdentityCard();
+    sendAck("CLEAR_IMEI", "AUTO_" + deviceImei);
+    return;
+  }
+  if (message.startsWith("SET_PHONE:")) {
+    normalizeAndSavePhoneNvs(message.substring(10));
+    printIdentityCard();
+    sendAck("SET_PHONE", alertPhoneIntl);
+    return;
+  }
+  if (message.startsWith("SET_PLATE:")) {
+    bikePlate = message.substring(10);
+    bikePlate.trim();
+    bikePlate.toUpperCase();
+    nvs.putString("plate", bikePlate);
+    printIdentityCard();
+    sendAck("SET_PLATE", bikePlate);
+    return;
+  }
+  if (message.startsWith("SET_EMAIL:")) {
+    ownerEmail = message.substring(10);
+    ownerEmail.trim();
+    ownerEmail.toLowerCase();
+    nvs.putString("email", ownerEmail);
+    printIdentityCard();
+    sendAck("SET_EMAIL", ownerEmail);
+    return;
+  }
+
   if (message.startsWith("GEOFENCE_SET:")) {
     applyGeofenceCommand(message.substring(13));
   } else if (message.indexOf("ENGINE_CUT") >= 0) {
     isImmobilized = true;
-    setImmobilizerRelay(true);
+    digitalWrite(PIN_RELAY_IMMOBILIZER, HIGH);
     digitalWrite(PIN_BLUE_LED, HIGH);
-    Serial.println("[ACTION] ⛔ ENGINE IMMOBILIZED! Relay CH1 (IN1) activated | Blue LED: OFF.");
+    Serial.println("[ACTION] ⛔ ENGINE IMMOBILIZED! Relay activated | Blue LED: OFF.");
     sendAck("ENGINE_CUT", "EXECUTED");
   } else if (message.indexOf("ENGINE_RESTORE") >= 0) {
     isImmobilized = false;
-    setImmobilizerRelay(false);
+    digitalWrite(PIN_RELAY_IMMOBILIZER, LOW);
     digitalWrite(PIN_BLUE_LED, LOW);
-    Serial.println("[ACTION] ✅ ENGINE RESTORED! Relay CH1 (IN1) deactivated | Blue LED: ON (Running).");
+    Serial.println("[ACTION] ✅ ENGINE RESTORED! Relay deactivated | Blue LED: ON (Running).");
     sendAck("ENGINE_RESTORE", "EXECUTED");
   }
 }
@@ -1531,6 +1475,9 @@ void sendAck(String action, String status) {
   String ackPayload = "{";
   ackPayload += "\"device_imei\":\"" + deviceImei + "\",";
   ackPayload += "\"hardware_imei\":\"" + hardwareImei + "\",";
+  ackPayload += "\"board_type\":\"" + String(BOARD_TYPE) + "\",";
+  ackPayload += "\"fw_version\":\"" + String(FIRMWARE_VERSION) + "\",";
+  ackPayload += "\"plate\":\"" + bikePlate + "\",";
   ackPayload += "\"command_action\":\"" + action + "\",";
   ackPayload += "\"status\":\"" + status + "\",";
   ackPayload += "\"ack_timestamp\":" + String(millis());
@@ -1538,4 +1485,305 @@ void sendAck(String action, String status) {
 
   sim7000PublishMqtt(TOPIC_ACK, ackPayload);
   Serial.println("[MQTT ACK -> " + TOPIC_ACK + "]: " + ackPayload);
+}
+
+String extractJsonField(const String& json, const char* key) {
+  String pat = "\"" + String(key) + "\"";
+  int kIdx = json.indexOf(pat);
+  if (kIdx < 0) return "";
+  int colon = json.indexOf(':', kIdx + pat.length());
+  if (colon < 0) return "";
+  int q1 = json.indexOf('"', colon + 1);
+  if (q1 < 0) return "";
+  int q2 = json.indexOf('"', q1 + 1);
+  if (q2 < 0) return "";
+  return json.substring(q1 + 1, q2);
+}
+
+/**
+ * Dual-Path Internet OTA Updater for LILYGO T-SIM7000G:
+ *   1. Fast Wi-Fi HTTP Stream (if connected to Hotspot / Workshop Wi-Fi)
+ *   2. Nationwide Cellular SIM7000G HTTP Client (AT+SHCONF / AT+SHREQ / AT+SHREAD)
+ */
+void executeLilygoInternetOta(const String& url, const String& targetVer, const String& expectedMd5) {
+  Serial.println("==================================================================");
+  Serial.println("[OTA] 🚀 LILYGO T-SIM7000G INTERNET FIRMWARE UPDATE TRIGGERED!");
+  Serial.println("[OTA] Version : v" + targetVer + " (Current: v" + String(FIRMWARE_VERSION) + ")");
+  Serial.println("[OTA] URL     : " + url);
+  Serial.println("==================================================================");
+
+  if (gnss.hasFix && gnss.speedKmh >= 2.0f) {
+    Serial.println("[OTA SAFETY] ⛔ Motorcycle moving (" + String(gnss.speedKmh, 1) + " km/h)! Deferring OTA.");
+    sendAck("OTA_DEFERRED_MOVING", "SPEED_" + String(gnss.speedKmh, 1));
+    return;
+  }
+
+  if (!pendingOtaForce && targetVer.length() > 0 && targetVer == String(FIRMWARE_VERSION)) {
+    sendAck("OTA_SKIPPED", "ALREADY_V" + String(FIRMWARE_VERSION));
+    return;
+  }
+
+  sendAck("OTA_STARTED", "DOWNLOADING_V" + targetVer);
+
+  bool ok = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[OTA] Streaming .bin via Wi-Fi HTTPClient...");
+    ok = runLilygoWifiHttpOta(url, expectedMd5);
+  }
+  if (!ok && modemReady) {
+    Serial.println("[OTA] Streaming .bin via SIM7000G Cellular HTTP (AT+SHREQ / AT+SHREAD)...");
+    ok = runSim7000CellularHttpOta(url, expectedMd5);
+  }
+
+  if (ok) {
+    Serial.println("[OTA] ✅ LILYGO FLASH COMPLETE! Rebooting into v" + targetVer + "...");
+    sendAck("OTA_SUCCESS", "INSTALLED_V" + targetVer);
+    delay(800);
+    ESP.restart();
+  } else {
+    Serial.println("[OTA] ❌ OTA Failed — preserving v" + String(FIRMWARE_VERSION) + " safely.");
+    sendAck("OTA_FAILED", "ROLLED_BACK_V" + String(FIRMWARE_VERSION));
+  }
+}
+
+bool runLilygoWifiHttpOta(const String& url, const String& expectedMd5) {
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(25000);
+  if (!http.begin(url)) return false;
+
+  const char* hdrs[] = { "x-MD5" };
+  http.collectHeaders(hdrs, 1);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  int totalLen = http.getSize();
+  String md5 = expectedMd5.length() == 32 ? expectedMd5 : http.header("x-MD5");
+  md5.trim();
+
+  if (totalLen <= 0 || !Update.begin(totalLen)) {
+    http.end();
+    return false;
+  }
+  if (md5.length() == 32) Update.setMD5(md5.c_str());
+
+  size_t written = Update.writeStream(*http.getStreamPtr());
+  http.end();
+  if (written != (size_t)totalLen) {
+    Update.abort();
+    return false;
+  }
+  return Update.end(true) && Update.isFinished();
+}
+
+bool runSim7000CellularHttpOta(const String& url, const String& expectedMd5) {
+  // Parse origin ("http://host:port") and path ("/api/ota/download/lilygo_tsim7000g")
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) return false;
+  int pathStart = url.indexOf('/', schemeEnd + 3);
+  String origin = (pathStart > 0) ? url.substring(0, pathStart) : url;
+  String reqPath = (pathStart > 0) ? url.substring(pathStart) : "/";
+
+  // Pause MQTT client briefly so SIM7000G SHCONN HTTP engine gets dedicated socket
+  sendAT("AT+SMDISC", 1000);
+  mqttConnected = false;
+
+  sendAT("AT+SHDISC", 800);
+  sendAT("AT+SHCONF=\"URL\",\"" + origin + "\"", 1000);
+  sendAT("AT+SHCONF=\"BODYLEN\",1024", 800);
+  sendAT("AT+SHCONF=\"HEADERLEN\",350", 800);
+
+  if (sendAT("AT+SHCONN", 12000).indexOf("OK") < 0) {
+    Serial.println("[-] SIM7000G AT+SHCONN failed.");
+    return false;
+  }
+
+  // Stream firmware in 2048-byte HTTP Range requests so SIM7000G RAM never overflows!
+  const int CHUNK = 2048;
+  uint8_t buf[CHUNK];
+  int offset = 0;
+  int totalBytes = -1;
+  bool updateStarted = false;
+
+  while (totalBytes < 0 || offset < totalBytes) {
+    int endByte = offset + CHUNK - 1;
+    sendAT("AT+SHCHEAD", 500);
+    sendAT("AT+SHAHEAD=\"Range\",\"bytes=" + String(offset) + "-" + String(endByte) + "\"", 600);
+
+    while (SerialModem.available()) SerialModem.read();
+    SerialModem.println("AT+SHREQ=\"" + reqPath + "\",1");
+
+    String shResp = "";
+    unsigned long t0 = millis();
+    while (millis() - t0 < 20000UL) {
+      while (SerialModem.available()) shResp += (char)SerialModem.read();
+      if (shResp.indexOf("+SHREQ:") >= 0 && shResp.indexOf('\n', shResp.indexOf("+SHREQ:")) >= 0) break;
+      delay(15);
+    }
+
+    int srIdx = shResp.indexOf("+SHREQ:");
+    if (srIdx < 0) {
+      if (updateStarted) Update.abort();
+      sendAT("AT+SHDISC", 800);
+      return false;
+    }
+
+    String srLine = shResp.substring(srIdx + 7);
+    srLine.trim();
+    int status = getCsvField(srLine, 1).toInt();
+    int chunkLen = getCsvField(srLine, 2).toInt();
+
+    if ((status != 206 && status != 200) || chunkLen <= 0) {
+      if (updateStarted) Update.abort();
+      sendAT("AT+SHDISC", 800);
+      return false;
+    }
+
+    if (!updateStarted) {
+      // If server returned 200 full or 206 partial, initialize Update with UNKNOWN_SIZE if total unknown
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        sendAT("AT+SHDISC", 800);
+        return false;
+      }
+      if (expectedMd5.length() == 32) Update.setMD5(expectedMd5.c_str());
+      updateStarted = true;
+    }
+
+    while (SerialModem.available()) SerialModem.read();
+    SerialModem.println("AT+SHREAD=0," + String(chunkLen));
+
+    String hdr = "";
+    t0 = millis();
+    bool gotHdr = false;
+    while (millis() - t0 < 8000UL) {
+      if (SerialModem.available()) {
+        char c = (char)SerialModem.read();
+        hdr += c;
+        int p = hdr.indexOf("+SHREAD:");
+        if (p >= 0 && c == '\n' && hdr.indexOf('\n', p) >= 0) {
+          gotHdr = true;
+          break;
+        }
+      }
+    }
+    if (!gotHdr) {
+      Update.abort();
+      sendAT("AT+SHDISC", 800);
+      return false;
+    }
+
+    int got = 0;
+    t0 = millis();
+    while (got < chunkLen && (millis() - t0 < 8000UL)) {
+      if (SerialModem.available()) buf[got++] = (uint8_t)SerialModem.read();
+    }
+    if (got != chunkLen || Update.write(buf, got) != (size_t)got) {
+      Update.abort();
+      sendAT("AT+SHDISC", 800);
+      return false;
+    }
+
+    offset += got;
+    if (got < CHUNK) {
+      totalBytes = offset; // Reached final chunk of .bin!
+      break;
+    }
+  }
+
+  sendAT("AT+SHDISC", 800);
+  return Update.end(true) && Update.isFinished();
+}
+
+// ============================================================================
+// NVS PERMANENT IDENTITY & AUTOMATIC HARDWARE IMEI / CHIP ID ENGINE
+// ============================================================================
+String deriveChipImeiFromMac() {
+  uint64_t mac = ESP.getEfuseMac();
+  uint64_t num = (mac & 0xFFFFFFFFFFFFULL) % 10000000000ULL;
+  char buf[20];
+  snprintf(buf, sizeof(buf), "86360%010llu", (unsigned long long)num);
+  return String(buf);
+}
+
+void loadIdentityFromNvs() {
+  chipFallbackImei = deriveChipImeiFromMac();
+  nvs.begin("boda360", false);
+
+  imeiCustomLocked = nvs.getBool("imei_lock", false);
+  String savedCustom = nvs.getString("imei", "");
+  String cachedAuto  = nvs.getString("auto_imei", "");
+
+  bikePlate       = nvs.getString("plate", DEFAULT_FALLBACK_PLATE);
+  alertPhoneLocal = nvs.getString("phone_loc", DEFAULT_PHONE_LOCAL);
+  alertPhoneIntl  = nvs.getString("phone_intl", DEFAULT_PHONE_INTL);
+  ownerEmail      = nvs.getString("email", "");
+
+  hardwareImei = (cachedAuto.length() >= 14) ? cachedAuto : chipFallbackImei;
+
+  if (imeiCustomLocked && savedCustom.length() >= 8) {
+    deviceImei = savedCustom;
+  } else if (cachedAuto.length() >= 14) {
+    deviceImei = cachedAuto;
+  } else {
+    deviceImei = chipFallbackImei;
+  }
+  refreshMqttTopics();
+}
+
+void refreshMqttTopics() {
+  TOPIC_TELEMETRY  = "boda/" + deviceImei + "/telemetry";
+  TOPIC_COMMAND    = "boda/" + deviceImei + "/command";
+  TOPIC_COMMAND_HW = "boda/" + hardwareImei + "/command";
+  TOPIC_ACK        = "boda/" + deviceImei + "/ack";
+  TOPIC_TAMPER     = "boda/" + deviceImei + "/tamper";
+}
+
+void normalizeAndSavePhoneNvs(const String& rawPhone) {
+  String digits = "";
+  for (unsigned int i = 0; i < rawPhone.length(); i++) {
+    char c = rawPhone.charAt(i);
+    if ((c >= '0' && c <= '9') || (c == '+' && digits.length() == 0)) {
+      digits += c;
+    }
+  }
+  if (digits.startsWith("+256") && digits.length() >= 12) {
+    alertPhoneIntl  = digits;
+    alertPhoneLocal = "0" + digits.substring(4);
+  } else if (digits.startsWith("256") && digits.length() >= 11) {
+    alertPhoneIntl  = "+" + digits;
+    alertPhoneLocal = "0" + digits.substring(3);
+  } else if (digits.startsWith("0") && digits.length() >= 10) {
+    alertPhoneLocal = digits;
+    alertPhoneIntl  = "+256" + digits.substring(1);
+  } else if (digits.length() >= 8) {
+    alertPhoneLocal = digits;
+    alertPhoneIntl  = digits.startsWith("+") ? digits : ("+" + digits);
+  }
+  nvs.putString("phone_loc", alertPhoneLocal);
+  nvs.putString("phone_intl", alertPhoneIntl);
+}
+
+bool isAuthorizedOwnerSender(const String& sender) {
+  if (sender.length() == 0) return true;
+  String tail = alertPhoneLocal.length() >= 8
+    ? alertPhoneLocal.substring(alertPhoneLocal.length() - 8)
+    : alertPhoneLocal;
+  return tail.length() > 0 && sender.indexOf(tail) >= 0;
+}
+
+void printIdentityCard() {
+  String modeStr = imeiCustomLocked
+    ? "CUSTOM NVS LOCKED"
+    : ((hardwareImei != chipFallbackImei) ? "AUTO SIM7000G AT+GSN" : "AUTO ESP32 SILICON MAC");
+  Serial.println("┌──────── BODA 360 PERMANENT BOARD IDENTITY (NVS) ────────┐");
+  Serial.println("│ Active Device IMEI : " + deviceImei + " (" + modeStr + ")");
+  Serial.println("│ Modem AT+GSN IMEI  : " + hardwareImei);
+  Serial.println("│ ESP32 Chip Fallback: " + chipFallbackImei);
+  Serial.println("│ Bound Bike Plate   : " + bikePlate);
+  Serial.println("│ Owner Voice/SMS    : " + alertPhoneLocal + " (" + alertPhoneIntl + ")");
+  Serial.println("│ Owner Account Email: " + (ownerEmail.length() ? ownerEmail : String("(awaiting customer sign-up)")));
+  Serial.println("└─────────────────────────────────────────────────────────┘");
 }
