@@ -140,6 +140,8 @@ const unsigned long MQTT_RETRY_INTERVAL_MS = 25000UL;
 
 // Smart Motion & Vibration-Wake Battery Saver Sleep State
 bool          isPowerSaveSleep            = false;
+bool          main12vArmed                = false;
+unsigned long lastBatteryCheckMs          = 0;
 unsigned long lastMotionOrVibMs           = 0;
 const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // 3 minutes of 0 motion & 0 vibration enters Smart Sleep
 const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
@@ -309,6 +311,15 @@ void loop() {
   checkPiezoVibrationSensor();
   if (mpuAvailable) {
     checkMpu6050Tamper();
+  }
+
+  // 2B. Continuous 250ms 12V Motorcycle Battery Removal / Wire-Cut Monitor (GPIO 34)
+  if (millis() - lastBatteryCheckMs >= 250) {
+    lastBatteryCheckMs = millis();
+    float mainV = (analogRead(PIN_MAIN_BATT_ADC) / 4095.0f) * 3.3f * ((100.0f + 22.0f) / 22.0f);
+    float bkupV = (analogRead(PIN_BACKUP_BATT_ADC) / 4095.0f) * 3.3f * 2.0f * 1.1f;
+    (void)analogRead(PIN_PIEZO_VIBRATION);
+    checkBatteryCutTamper(mainV, bkupV);
   }
 
   // 3. Non-Blocking Local Siren Strobe & SIM800L 25s Voice Call Auto-Hangup
@@ -959,12 +970,24 @@ void triggerTamperAlert(float gForce, int piezoDelta, const char* sourceName) {
 }
 
 void checkBatteryCutTamper(float mainBattV, float backupBattV) {
-  // If main 12V bike battery wire is cut (< 4.5V) while backup 3.7V Li-Ion is powering ESP32+SIM800L (> 3.2V)
-  if (mainBattV < 4.5f && backupBattV > 3.2f && !mainPowerCutAlerted) {
+  if (mainBattV >= 8.5f) {
+    if (!main12vArmed) {
+      main12vArmed = true;
+      Serial.println("[12V SENSE] 🔋 Main 12V Motorcycle Battery detected (" + String(mainBattV, 2) + "V) -> Wire-Cut/Removal protection ARMED.");
+    }
+    if (mainPowerCutAlerted && mainBattV >= 9.2f) {
+      mainPowerCutAlerted = false;
+      if (isPowerSaveSleep) exitSmartSleepMode("12V_BATTERY_RECONNECTED");
+      Serial.println("[12V SENSE] ✅ Main 12V Motorcycle Battery reconnected (" + String(mainBattV, 2) + "V).");
+    }
+  } else if ((main12vArmed || backupBattV > 3.2f) && mainBattV < 5.0f && !mainPowerCutAlerted) {
     mainPowerCutAlerted = true;
-    triggerTamperAlert(5.0f, 500, "12V_BATTERY_CUT");
-  } else if (mainBattV > 9.5f) {
-    mainPowerCutAlerted = false;
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("12V_BATTERY_REMOVED");
+    }
+    Serial.println("[!] 🚨 12V MOTORCYCLE BATTERY REMOVED / WIRE CUT (GPIO 34 dropped to " + String(mainBattV, 2) + "V)! Running on backup Li-Ion...");
+    triggerTamperAlert(5.0f, 500, "12V_BATTERY_REMOVED");
   }
 }
 

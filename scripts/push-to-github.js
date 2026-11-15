@@ -59,19 +59,24 @@ function githubRequest(method, apiPath, bodyObj) {
 }
 
 async function ensureRepo(username, repoName, description) {
-  const res = await githubRequest('POST', '/user/repos', {
-    name: repoName,
-    description,
-    private: false,
-    auto_init: false
-  });
-
-  if (res.status === 201) {
-    console.log(`✅ Created GitHub repository: ${res.data.html_url}`);
-  } else if (res.status === 422) {
+  const checkRes = await githubRequest('GET', `/repos/${username}/${repoName}`);
+  if (checkRes.status === 200) {
     console.log(`ℹ️  GitHub repository exists: https://github.com/${username}/${repoName}`);
   } else {
-    throw new Error(`GitHub API (${res.status}): ${JSON.stringify(res.data)}`);
+    const res = await githubRequest('POST', '/user/repos', {
+      name: repoName,
+      description,
+      private: false,
+      auto_init: false
+    });
+
+    if (res.status === 201) {
+      console.log(`✅ Created GitHub repository: ${res.data.html_url}`);
+    } else if (res.status === 422) {
+      console.log(`ℹ️  GitHub repository exists: https://github.com/${username}/${repoName}`);
+    } else {
+      throw new Error(`GitHub API (${res.status}): ${JSON.stringify(res.data)}`);
+    }
   }
 
   return {

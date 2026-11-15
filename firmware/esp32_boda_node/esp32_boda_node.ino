@@ -92,6 +92,9 @@ const unsigned long MQTT_RECONNECT_INTERVAL = 30000;  // 30s cellular MQTT retry
 
 // Smart Motion & Vibration-Wake Battery Saver Sleep State
 bool          isPowerSaveSleep            = false;
+bool          main12vArmed                = false;
+bool          mainPowerCutAlerted         = false;
+unsigned long lastBatteryCheckMs          = 0;
 unsigned long lastMotionOrVibMs           = 0;
 const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // Enter sleep after 3 mins (180,000 ms) of 0 motion & 0 vibration
 const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
@@ -198,6 +201,7 @@ void printIdentityCard();
 void manageSmartSleepMode();
 void enterSmartSleepMode();
 void exitSmartSleepMode(const char* wakeReason);
+void checkMain12vBatteryCut();
 
 void setup() {
   Serial.begin(115200);
@@ -271,6 +275,10 @@ void loop() {
   // 1. High-speed Analog Piezoelectric Ceramic Vibration/Shock Sampling (GPIO 32)
   //    Senses even gentle vibrations to immediately wake the board from Smart Sleep!
   checkPiezoVibrationSensor();
+
+  // 1B. Continuous 12V Motorcycle Battery Removal / Wire-Cut Monitor (GPIO 34)
+  //     Immediately wakes the board from Smart Sleep & fires Tamper Alert if 12V is removed!
+  checkMain12vBatteryCut();
 
   // 2. Non-blocking Offline Local Alarm Buzzer & LED Strobe Timer
   manageLocalAlarm();
@@ -524,7 +532,11 @@ bool sendTamperSmsAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   lastTamperSmsMs = millis();
 
   String smsBody = "[BODA TAMPER " + bikePlate + "]\n";
-  smsBody += "VIBRATION ALERT! Shock: " + String(gForce, 1) + "G\n";
+  if (String(sourceName).indexOf("12V_BATTERY") >= 0) {
+    smsBody += "12V BATTERY REMOVED/CUT! (Running on 18650 Backup)\n";
+  } else {
+    smsBody += "VIBRATION ALERT! Shock: " + String(gForce, 1) + "G\n";
+  }
   smsBody += String(isImmobilized ? "Engine: LOCKED\n" : "Reply STOP to cut engine\n");
   smsBody += "https://maps.google.com/?q=" + String(gnss.latitude, 6) + "," + String(gnss.longitude, 6);
   return sendDirectSimSms(smsBody, "Tamper Alert");
@@ -1312,6 +1324,45 @@ void exitSmartSleepMode(const char* wakeReason) {
 
   sendAck("POWER_MODE", "AWAKE_" + String(wakeReason));
   lastTelemetryTime = 0; // Force immediate telemetry transmission
+}
+
+/**
+ * High-speed 12V Motorcycle Battery Removal / Wire-Cut Monitor (GPIO 34):
+ *   - Samples the 100k/22k divider every 250ms (even while in Smart Sleep Mode).
+ *   - Once 12V battery is present (>= 8.5V), any removal or cable cut (< 5.0V)
+ *     immediately wakes the board from Smart Sleep and triggers the full Tamper Alert
+ *     while the LILYGO continues running on its onboard 18650 backup battery!
+ */
+void checkMain12vBatteryCut() {
+  if (millis() - lastBatteryCheckMs < 250) return;
+  lastBatteryCheckMs = millis();
+
+  int rawADC = analogRead(PIN_BATTERY_ADC);
+  // Pre-charge shared SAR ADC1 sample-and-hold cap back onto GPIO 32
+  (void)analogRead(PIN_PIEZO_VIBRATION);
+
+  float mainBattV = (rawADC / 4095.0f) * 3.3f * ((100.0f + 22.0f) / 22.0f);
+
+  if (mainBattV >= 8.5f) {
+    if (!main12vArmed) {
+      main12vArmed = true;
+      Serial.println("[12V SENSE] 🔋 Main 12V Motorcycle Battery detected (" + String(mainBattV, 2) + "V) -> Wire-Cut/Removal protection ARMED.");
+    }
+    if (mainPowerCutAlerted && mainBattV >= 9.2f) {
+      mainPowerCutAlerted = false;
+      if (isPowerSaveSleep) exitSmartSleepMode("12V_BATTERY_RECONNECTED");
+      Serial.println("[12V SENSE] ✅ Main 12V Motorcycle Battery reconnected (" + String(mainBattV, 2) + "V).");
+    }
+  } else if (main12vArmed && mainBattV < 5.0f && !mainPowerCutAlerted) {
+    mainPowerCutAlerted = true;
+    lastMotionOrVibMs = millis();
+    if (isPowerSaveSleep) {
+      exitSmartSleepMode("12V_BATTERY_REMOVED");
+    }
+    Serial.println("[!] 🚨 12V MOTORCYCLE BATTERY REMOVED / WIRE CUT (GPIO 34 dropped to " + String(mainBattV, 2) + "V)! Running on 18650 backup cell...");
+    triggerTamperAlert(5.0f, 500, "12V_BATTERY_REMOVED");
+    placeTamperVoiceCall("12V_BATTERY_REMOVED");
+  }
 }
 
 /**
