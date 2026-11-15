@@ -33,7 +33,10 @@ function copyRecursive(src, dest) {
 function buildApiBridgeScript(apiBaseUrl) {
   return `/* Auto-generated Render Cross-Service API & WebSocket Bridge */
 (function () {
-  var configuredBase = ${JSON.stringify(apiBaseUrl)} || window.localStorage.getItem('BODA_API_BASE_URL') || '';
+  var isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+  var configuredBase = isLocalHost
+    ? ''
+    : (${JSON.stringify(apiBaseUrl)} || window.localStorage.getItem('BODA_API_BASE_URL') || 'https://boda360-backend-api.onrender.com');
   configuredBase = String(configuredBase || '').replace(/\\/+$/, '');
   window.BODA_API_BASE_URL = configuredBase;
   if (!configuredBase) return;
@@ -43,6 +46,13 @@ function buildApiBridgeScript(apiBaseUrl) {
     window.fetch = function (input, init) {
       if (typeof input === 'string' && input.indexOf('/api/') === 0) {
         input = configuredBase + input;
+        init = Object.assign({}, init || {});
+        if (!init.signal && typeof AbortController !== 'undefined') {
+          var ctrl = new AbortController();
+          var timer = setTimeout(function () { ctrl.abort(); }, 3500);
+          init.signal = ctrl.signal;
+          return origFetch(input, init).finally(function () { clearTimeout(timer); });
+        }
       }
       return origFetch(input, init);
     };
