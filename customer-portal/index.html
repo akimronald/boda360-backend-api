@@ -1391,7 +1391,7 @@
       <form id="form-add-bike">
         <div class="modal-body">
           <!-- Post-Signup Welcome Banner (Shown automatically right after Sign Up) -->
-          <div id="add-bike-onboarding-banner" class="signup-step-banner hidden" style="margin-bottom: 14px;">
+          <div id="add-bike-onboarding-banner" class="signup-step-banner hidden" style="margin-bottom: 10px;">
             <div class="signup-step-title">
               <span class="signup-step-badge">2</span>
               <span>Account created! Now enter your Tracker IMEI &amp; Bike details to activate tracking</span>
@@ -1425,8 +1425,8 @@
             </div>
 
             <div class="form-group" style="grid-column: 1 / -1;">
-              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 5px;">
-                <label for="add-bike-imei" style="margin-bottom: 0;">Tracker Device IMEI (15-Digit Hardware ID) <span class="text-danger">*</span></label>
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px;">
+                <label for="add-bike-imei" style="margin-bottom: 0;">Tracker Device IMEI (15-Digit SIM Module ID) <span class="text-danger">*</span></label>
                 <button type="button" class="btn-autofill-imei" id="btn-autofill-imei" title="Auto-fill next available pre-provisioned tracker IMEI">
                   <i class="fa-solid fa-wand-magic-sparkles"></i> Auto-Fill Available IMEI
                 </button>
@@ -1466,24 +1466,17 @@
             </div>
 
             <div class="form-group">
-              <label for="add-bike-chassis">Chassis / Frame Number <span class="text-muted" style="font-weight: 400;">(Optional)</span></label>
-              <div class="input-with-icon">
-                <i class="fa-solid fa-barcode"></i>
-                <input type="text" id="add-bike-chassis" class="form-control font-mono" placeholder="e.g. MD2A12AY9PW0081" style="text-transform: uppercase;" />
-              </div>
-            </div>
-
-            <div class="form-group" style="grid-column: 1 / -1;">
               <div style="display: flex; justify-content: space-between; align-items: center;">
-                <label for="add-bike-location">Base / Stage Location</label>
+                <label for="add-bike-location" style="margin-bottom: 0;">Base / Stage Location</label>
                 <button type="button" class="btn-autofill-imei" id="btn-add-bike-use-gps" title="Use my current browser GPS or active map center">
-                  <i class="fa-solid fa-location-crosshairs"></i> Use Current GPS
+                  <i class="fa-solid fa-location-crosshairs"></i> Use GPS
                 </button>
               </div>
               <div class="input-with-icon">
                 <i class="fa-solid fa-location-dot"></i>
                 <input type="text" id="add-bike-location" class="form-control" placeholder="e.g. Kampala Central Stage" value="Kampala Registered Base" />
               </div>
+              <input type="hidden" id="add-bike-chassis" value="" />
               <input type="hidden" id="add-bike-lat" value="" />
               <input type="hidden" id="add-bike-lng" value="" />
             </div>
@@ -1493,7 +1486,7 @@
         <div class="modal-footer">
           <button type="button" class="btn btn-outline" id="btn-cancel-add-bike">Cancel</button>
           <button type="submit" class="btn btn-primary" id="btn-submit-add-bike">
-            <i class="fa-solid fa-circle-plus"></i> Add Bike to My Profile
+            <i class="fa-solid fa-satellite-dish"></i> Activate Tracker &amp; Bike
           </button>
         </div>
       </form>
