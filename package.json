@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node backend/server.js",
     "dev": "node --watch backend/server.js",
-    "build:render": "node scripts/prepare-render-static.js"
+    "build:render": "node scripts/prepare-render-static.js",
+    "push:github": "node scripts/push-to-github.js"
   },
   "keywords": [
     "iot",
