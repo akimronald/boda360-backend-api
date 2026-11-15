@@ -1,0 +1,79 @@
+# ============================================================================
+# BODA 360 — RENDER BLUEPRINT (DIVIDED MULTI-SERVICE ARCHITECTURE)
+# Deploys 4 separated cloud resources on Render from this repository:
+#   1. boda360-backend-api         (Node.js Web Service: REST API + WebSocket + MQTT Bridge + OTA)
+#   2. boda360-customer-portal     (Static Site: Public Gateway + Customer Tracking Portal)
+#   3. boda360-manufacturer-portal (Static Site: Factory Provisioning + Dual-MCU OTA Admin Portal)
+#   4. boda360-postgres-db         (Managed PostgreSQL Database)
+# ============================================================================
+
+databases:
+  - name: boda360-postgres-db
+    databaseName: boda_iot_db
+    user: boda360_user
+    plan: free
+
+services:
+  # --------------------------------------------------------------------------
+  # PART 1: CENTRAL BACKEND API, WEBSOCKET & HIVEMQ CLOUD MQTT GATEWAY
+  # --------------------------------------------------------------------------
+  - type: web
+    name: boda360-backend-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ENABLE_SIMULATOR
+        value: "false"
+      - key: MQTT_BROKER_HOST
+        value: broker.hivemq.com
+      - key: MQTT_BROKER_PORT
+        value: "1883"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: boda360-postgres-db
+          property: connectionString
+
+  # --------------------------------------------------------------------------
+  # PART 2: CUSTOMER & RIDER TELEMATICS PORTAL (STATIC SITE)
+  # --------------------------------------------------------------------------
+  - type: web
+    name: boda360-customer-portal
+    runtime: static
+    buildCommand: npm run build:render
+    staticPublishPath: ./dist/customer
+    envVars:
+      - key: API_BASE_URL
+        value: https://boda360-backend-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://boda360-backend-api.onrender.com/api/*
+      - type: rewrite
+        source: /customer/*
+        destination: /customer/index.html
+
+  # --------------------------------------------------------------------------
+  # PART 3: MANUFACTURER, BATCH PROVISIONING & OTA ADMIN PORTAL (STATIC SITE)
+  # --------------------------------------------------------------------------
+  - type: web
+    name: boda360-manufacturer-portal
+    runtime: static
+    buildCommand: npm run build:render
+    staticPublishPath: ./dist/manufacturer
+    envVars:
+      - key: API_BASE_URL
+        value: https://boda360-backend-api.onrender.com
+    routes:
+      - type: rewrite
+        source: /api/*
+        destination: https://boda360-backend-api.onrender.com/api/*
+      - type: rewrite
+        source: /*
+        destination: /index.html

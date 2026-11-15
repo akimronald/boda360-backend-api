@@ -1,0 +1,22 @@
+CompileFlags:
+  Add:
+    - "-x"
+    - "c++"
+    - "-IC:/Users/OMEN TRANCEND Gaming/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/cores/esp32"
+    - "-IC:/Users/OMEN TRANCEND Gaming/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/variants/esp32"
+    - "-IC:/Users/OMEN TRANCEND Gaming/AppData/Local/Arduino15/packages/esp32/tools/esp32-libs/3.3.11/include"
+    - "-IC:/Users/OMEN TRANCEND Gaming/AppData/Local/Arduino15/packages/esp32/hardware/esp32/3.3.11/libraries/Wire/src"
+    - "-IC:/Users/OMEN TRANCEND Gaming/Documents/Arduino/libraries/TinyGPSPlus/src"
+    - "-IC:/Users/OMEN TRANCEND Gaming/Documents/Arduino/libraries/PubSubClient/src"
+    - "-IC:/Users/OMEN TRANCEND Gaming/Documents/Arduino/libraries/Adafruit_MPU6050"
+    - "-IC:/Users/OMEN TRANCEND Gaming/Documents/Arduino/libraries/Adafruit_Unified_Sensor"
+    - "-IC:/Users/OMEN TRANCEND Gaming/Documents/Arduino/libraries/Adafruit_BusIO"
+    - "-DESP32"
+    - "-DARDUINO=10819"
+    - "-Wno-everything"
+
+Diagnostics:
+  Suppress:
+    - "*"
+    - "unknown_type"
+    - "err_unknown_type"
