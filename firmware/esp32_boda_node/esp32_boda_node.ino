@@ -1156,10 +1156,10 @@ void calibratePiezoSensor() {
     if (d > maxNoise) maxNoise = d;
     delay(1);
   }
-  piezoNoisePeak = constrain(maxNoise, 5, 78);
+  piezoNoisePeak = constrain(maxNoise, 5, 95);
 
-  int dynamicThresh = piezoNoisePeak + 20;
-  piezoTamperThreshold = constrain(max(95, dynamicThresh), 95, 112);
+  int dynamicThresh = piezoNoisePeak + 35;
+  piezoTamperThreshold = constrain(max(125, dynamicThresh), 125, 145);
 
   Serial.println("[+] Analog Piezo Sensor calibrated on GPIO 32 (Baseline: " +
                  String(piezoBaseline, 1) + ", NoiseFloor: " + String(piezoNoisePeak) +

@@ -33,6 +33,13 @@ function setBroadcastCallback(cb) {
 function startGateway(broadcast) {
   if (broadcast) broadcastCallback = broadcast;
 
+  // On Linux cloud servers (e.g. Render), Windows COM ports and powershell.exe do not exist;
+  // hardware communicates wirelessly via HiveMQ Cellular MQTT Bridge (`cloudMqttBridge.js`).
+  if (process.platform !== 'win32' || process.env.RENDER) {
+    console.log('☁️  [Serial Gateway] Cloud Linux environment detected — using Wireless Cellular MQTT Bridge (broker.hivemq.com:1883).');
+    return;
+  }
+
   console.log(`🔌 [Serial Gateway] Initializing hardware bridge on ${portName} @ ${baudRate} baud...`);
 
   const scriptPath = path.join(getScriptsDir(), 'serial_bridge.ps1');
@@ -49,6 +56,11 @@ function startGateway(broadcast) {
       '-Port', portName,
       '-Baud', String(baudRate)
     ]);
+
+    childProcess.on('error', (err) => {
+      console.warn('⚠️  [Serial Gateway] Spawn warning:', err.message);
+      isConnected = false;
+    });
 
     let lineBuffer = '';
 

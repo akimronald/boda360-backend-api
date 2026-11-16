@@ -4657,6 +4657,13 @@
             bk.transport = 'OFFLINE';
           }
         });
+        if (data.latest_telemetry && (anyOnlineDevice || (data.device && data.device.is_online))) {
+          handleLiveTelemetryPacket({
+            ...data.latest_telemetry,
+            is_real_hardware: true,
+            transport: (anyOnlineDevice && anyOnlineDevice.transport) || (data.device && data.device.transport) || 'USB_SERIAL'
+          });
+        }
         syncDeviceOnlineOfflineUI(null);
       } else if (data && data.device) {
         applyDeviceConnectionStatus(data.device, isManualRecheck);

@@ -196,10 +196,15 @@ app.post('/api/hardware/test-tamper', (req, res) => {
 
 app.get('/api/hardware/status', (req, res) => {
   const primary = deviceStatusService.getDeviceStatus();
+  const latestTel =
+    db.store.telemetry_logs && db.store.telemetry_logs.length > 0
+      ? db.store.telemetry_logs[db.store.telemetry_logs.length - 1]
+      : null;
   res.json({
     success: true,
     device: primary,
-    devices: deviceStatusService.getAllDeviceStatuses()
+    devices: deviceStatusService.getAllDeviceStatuses(),
+    latest_telemetry: latestTel
   });
 });
 
@@ -289,4 +294,4 @@ if (require.main === module) {
   start();
 }
 
-module.exports = { app, server };
+module.exports = { app, server, start };
