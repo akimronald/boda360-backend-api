@@ -2932,8 +2932,12 @@
   }
 
   function handleLiveTelemetryPacket(p) {
-    const bike = state.bikes.find(b => b.imei === p.device_imei || b.plate === p.plate_number) ||
-      (!p.device_imei ? state.bikes[0] : null);
+    const bike =
+      state.bikes.find(
+        b => b.imei === p.device_imei || b.imei === p.hardware_imei || b.plate === p.plate_number
+      ) ||
+      state.bikes[state.activeBikeIndex] ||
+      state.bikes[0];
     if (bike) {
       // Mark device online on live hardware packet
       const wasOffline = bike.isOnline === false;
@@ -4604,7 +4608,7 @@
 
       state.bikes.forEach(bk => {
         if (bk && bk.isOnline === true && bk.lastTelemetryMs > 0) {
-          if (Date.now() - bk.lastTelemetryMs > 10500) {
+          if (Date.now() - bk.lastTelemetryMs > 30000) {
             bk.isOnline = false;
             bk.transport = 'OFFLINE';
             bk.speed = 0.0;
@@ -4637,12 +4641,14 @@
 
       if (data && Array.isArray(data.devices) && data.devices.length > 0) {
         const statusByImei = {};
+        let anyOnlineDevice = null;
         data.devices.forEach(d => {
           if (d && d.imei) statusByImei[d.imei] = d;
+          if (d && d.is_online && !anyOnlineDevice) anyOnlineDevice = d;
         });
 
         state.bikes.forEach((bk, idx) => {
-          const matched = statusByImei[bk.imei];
+          const matched = statusByImei[bk.imei] || (state.bikes.length === 1 && anyOnlineDevice ? anyOnlineDevice : null);
           const manualFlag = isManualRecheck && idx === state.activeBikeIndex;
           if (matched) {
             applyDeviceConnectionStatus(matched, manualFlag);
@@ -4675,8 +4681,10 @@
 
   function applyDeviceConnectionStatus(statusMsg, isManualRecheck) {
     if (!statusMsg) return;
-    const imei = statusMsg.imei || '865421045981201';
-    const bike = state.bikes.find(b => b.imei === imei || (statusMsg.plate && b.plate === statusMsg.plate));
+    const imei = statusMsg.imei || '869951038535641';
+    const bike =
+      state.bikes.find(b => b.imei === imei || (statusMsg.plate && b.plate === statusMsg.plate)) ||
+      (state.bikes.length === 1 ? state.bikes[0] : state.bikes[state.activeBikeIndex]);
     if (!bike) return;
 
     const prevOnline = bike.isOnline;

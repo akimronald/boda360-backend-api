@@ -107,10 +107,10 @@ router.get('/customer-feed', async (req, res) => {
     events.sort((a, b) => new Date(b.triggered_at) - new Date(a.triggered_at));
 
     const enriched = events.slice(0, 50).map(e => {
-      const moto = db.store.motorcycles.find(m => m.device_imei === e.device_imei);
+      const moto = db.store.motorcycles.find(m => m.device_imei === e.device_imei) || db.store.motorcycles[0];
       return {
         ...e,
-        plate_number: moto ? moto.plate_number : (e.device_imei === '865421045981201' ? 'UEV 412K' : 'UEV 412K'),
+        plate_number: e.plate_number || (moto ? moto.plate_number : 'UEV 412K'),
         model: moto ? moto.model : 'Bajaj Boxer BM150 (ESP32 Node)'
       };
     });
@@ -205,10 +205,13 @@ router.post('/trigger-tamper', async (req, res) => {
       return res.status(400).json({ success: false, message: 'device_imei is required.' });
     }
 
-    const moto = db.store.motorcycles.find(m => m.device_imei === device_imei) || db.store.motorcycles[0];
-    if (!moto) {
-      return res.status(404).json({ success: false, message: 'Motorcycle not found.' });
-    }
+    const moto =
+      db.store.motorcycles.find(m => m.device_imei === device_imei) ||
+      db.store.motorcycles[0] || {
+        plate_number: req.body.plate_number || 'UEV 412K',
+        device_imei,
+        status: 'active'
+      };
 
     const latestTel = db.store.telemetry_logs
       .filter(t => t.device_imei === device_imei)

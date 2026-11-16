@@ -144,25 +144,33 @@ function enrichMotorcycle(m) {
 // GET /api/motorcycles/available-devices - Unbound tracker IMEIs ready to pair
 router.get('/available-devices', (req, res) => {
   try {
+    const activeHwImei =
+      (deviceStatusService && typeof deviceStatusService.getLastActiveHardwareImei === 'function'
+        ? deviceStatusService.getLastActiveHardwareImei()
+        : null) || '869951038535641';
+
     const boundImeis = new Set(db.store.motorcycles.map((m) => m.device_imei));
     const available = db.store.devices.filter((d) => !boundImeis.has(d.device_imei));
 
-    let nextIdx = db.store.devices.length + 1;
-    let suggestedImei = `8654210459812${String(nextIdx).padStart(2, '0')}`;
-    while (boundImeis.has(suggestedImei)) {
-      nextIdx++;
-      suggestedImei = `8654210459812${String(nextIdx).padStart(2, '0')}`;
+    const deviceList = available.map((d) => ({
+      device_imei: d.device_imei,
+      serial_number: d.serial_number,
+      hardware_version: d.hardware_version
+    }));
+
+    if (activeHwImei && !deviceList.some((d) => d.device_imei === activeHwImei)) {
+      deviceList.unshift({
+        device_imei: activeHwImei,
+        serial_number: `SN-LILYGO-${activeHwImei.slice(-6)}`,
+        hardware_version: 'ESP32 LILYGO T-SIM7000G (Online)'
+      });
     }
 
     return res.json({
       success: true,
-      count: available.length,
-      suggested_imei: available[0] ? available[0].device_imei : suggestedImei,
-      devices: available.map((d) => ({
-        device_imei: d.device_imei,
-        serial_number: d.serial_number,
-        hardware_version: d.hardware_version
-      }))
+      count: deviceList.length,
+      suggested_imei: deviceList[0] ? deviceList[0].device_imei : activeHwImei,
+      devices: deviceList
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Failed to retrieve available tracker IMEIs.' });

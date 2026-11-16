@@ -106,7 +106,7 @@ wss.on('connection', (ws) => {
   }));
 
   // Immediately push live hardware online/offline status to newly connected dashboard
-  ws.send(JSON.stringify(deviceStatusService.getDeviceStatus('865421045981201')));
+  ws.send(JSON.stringify(deviceStatusService.getDeviceStatus()));
 
   ws.on('message', (message) => {
     try {
@@ -195,7 +195,7 @@ app.post('/api/hardware/test-tamper', (req, res) => {
 });
 
 app.get('/api/hardware/status', (req, res) => {
-  const primary = deviceStatusService.getDeviceStatus('865421045981201');
+  const primary = deviceStatusService.getDeviceStatus();
   res.json({
     success: true,
     device: primary,
@@ -205,7 +205,7 @@ app.get('/api/hardware/status', (req, res) => {
 
 // System Health & Info
 app.get('/api/system/status', (req, res) => {
-  const hwStatus = deviceStatusService.getDeviceStatus('865421045981201');
+  const hwStatus = deviceStatusService.getDeviceStatus();
   res.json({
     status: 'ONLINE',
     hardware_online: hwStatus.is_online,

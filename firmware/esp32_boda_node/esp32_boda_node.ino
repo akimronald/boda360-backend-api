@@ -97,7 +97,7 @@ bool          mainPowerCutAlerted         = false;
 unsigned long lastBatteryCheckMs          = 0;
 unsigned long lastMotionOrVibMs           = 0;
 const unsigned long STATIONARY_SLEEP_TIMEOUT_MS = 180000UL; // Enter sleep after 3 mins (180,000 ms) of 0 motion & 0 vibration
-const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 60000UL;  // 60s parked heartbeat while in Smart Sleep
+const unsigned long SLEEP_HEARTBEAT_INTERVAL_MS = 3500UL;   // 3.5s heartbeat in Smart Sleep so device stays 100% ONLINE & receives Engine Cut instantly
 const float         MOTION_SPEED_THRESHOLD_KMH  = 1.8f;     // Stay awake whenever GPS speed >= 1.8 km/h
 
 // Marked Perimeter (Geofence) & 10-Minute SMS Alert State
@@ -1095,15 +1095,9 @@ void publishTelemetryPayload() {
   payload += "\"gps_lock\":" + String(hasFix ? "true" : "false");
   payload += "}";
 
-  // Briefly wake SIM7000G DTR pin if publishing a 60s parked sleep heartbeat
-  if (isPowerSaveSleep && modemReady) {
-    digitalWrite(PIN_MODEM_DTR, LOW);
-    delay(40);
-  }
+  // Keep SIM7000G DTR LOW (awake) so Cellular MQTT & Serial Gateway stay 100% live and online
+  digitalWrite(PIN_MODEM_DTR, LOW);
   bool sentCell = sim7000PublishMqtt(TOPIC_TELEMETRY, payload);
-  if (isPowerSaveSleep && modemReady) {
-    digitalWrite(PIN_MODEM_DTR, HIGH);
-  }
 
   Serial.println("[MQTT TX -> " + TOPIC_TELEMETRY + "]: " + payload);
   Serial.print("[GPS STATUS] Carrier: ");
@@ -1162,10 +1156,10 @@ void calibratePiezoSensor() {
     if (d > maxNoise) maxNoise = d;
     delay(1);
   }
-  piezoNoisePeak = maxNoise;
+  piezoNoisePeak = constrain(maxNoise, 5, 78);
 
-  int dynamicThresh = (piezoNoisePeak * 3) + 35;
-  piezoTamperThreshold = constrain(max(80, dynamicThresh), 80, 260);
+  int dynamicThresh = piezoNoisePeak + 20;
+  piezoTamperThreshold = constrain(max(95, dynamicThresh), 95, 112);
 
   Serial.println("[+] Analog Piezo Sensor calibrated on GPIO 32 (Baseline: " +
                  String(piezoBaseline, 1) + ", NoiseFloor: " + String(piezoNoisePeak) +
@@ -1176,7 +1170,7 @@ void calibratePiezoSensor() {
  * High-speed AC-coupled peak detector for Analog Piezoelectric Ceramic Sensor (GPIO 32)
  */
 void checkPiezoVibrationSensor() {
-  if (millis() - lastModemRfActivityMs < 200) {
+  if (millis() - lastModemRfActivityMs < 140) {
     return;
   }
 
@@ -1197,7 +1191,7 @@ void checkPiezoVibrationSensor() {
 
   // Sensitive Vibration Wake Detector: Even light frame/engine vibration keeps the bike awake
   // or immediately wakes it from Stationary Smart Sleep Mode (< 2ms)!
-  int vibWakeThreshold = max(25, (piezoNoisePeak * 2) + 12);
+  int vibWakeThreshold = max(25, piezoNoisePeak + 12);
   if (delta >= vibWakeThreshold) {
     lastMotionOrVibMs = millis();
     if (isPowerSaveSleep) {
@@ -1206,17 +1200,12 @@ void checkPiezoVibrationSensor() {
   }
 
   if (delta >= piezoTamperThreshold && (millis() - lastTamperAlertMs >= TAMPER_COOLDOWN_MS)) {
-    delayMicroseconds(50); // Stay near crest of 1-2 kHz piezo half-wave (not 400us zero-crossing!)
-    int confirmDelta = abs(readFilteredPiezoADC() - baseInt);
-    if (confirmDelta >= (piezoTamperThreshold * 3 / 4)) {
-      int peak = max(delta, confirmDelta);
-      lastTamperAlertMs = millis();
-      float norm = (float)(peak - piezoTamperThreshold) / 600.0f;
-      if (norm < 0.0f) norm = 0.0f;
-      if (norm > 1.0f) norm = 1.0f;
-      float equivGForce = 3.4f + (norm * 8.6f);
-      triggerTamperAlert(equivGForce, peak, "PIEZO_GPIO32");
-    }
+    lastTamperAlertMs = millis();
+    float norm = (float)(delta - piezoTamperThreshold) / 300.0f;
+    if (norm < 0.0f) norm = 0.0f;
+    if (norm > 1.0f) norm = 1.0f;
+    float equivGForce = 3.6f + (norm * 8.4f);
+    triggerTamperAlert(equivGForce, delta, "PIEZO_GPIO32");
   }
 }
 
@@ -1280,7 +1269,7 @@ void enterSmartSleepMode() {
   if (isPowerSaveSleep) return;
   isPowerSaveSleep = true;
 
-  Serial.println("[SLEEP MODE] 🌙 Motorcycle stationary for 3 mins (0 vibration, 0 motion) -> Entering Smart Battery-Saver Sleep...");
+  Serial.println("[SLEEP MODE] 🌙 Motorcycle stationary for 3 mins (0 vibration, 0 motion) -> Entering Smart Battery-Saver Mode (80MHz CPU, Live MQTT Online)...");
   sendAck("POWER_MODE", "SLEEP_STATIONARY_BATTERY_SAVER");
 
   if (modemReady) {
@@ -1289,12 +1278,11 @@ void enterSmartSleepMode() {
     sendAT("AT+SGPIO=0,4,1,0", 800);
     gnssEnabled = false;
 
-    // Enable SIM7000G DTR Clock Sleep (DTR HIGH = Modem Sleep < 2mA, still wakes on SMS/Call/MQTT)
-    sendAT("AT+CSCLK=1", 800);
-    digitalWrite(PIN_MODEM_DTR, HIGH);
+    // Keep SIM7000G DTR LOW (awake) so Cellular MQTT (+SMSUB Engine Cut) & Online Heartbeat stay 100% instant!
+    digitalWrite(PIN_MODEM_DTR, LOW);
   }
 
-  // Scale ESP32 CPU down to 80 MHz while keeping Piezo Vibration ADC (GPIO 32) active!
+  // Scale ESP32 CPU down to 80 MHz while keeping Piezo Vibration ADC (GPIO 32) & 12V Sense (GPIO 34) active!
   setCpuFrequencyMhz(80);
 }
 
@@ -1375,13 +1363,18 @@ void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   // 1. Activate Offline Local Buzzer/Siren (GPIO 14) + Rapid Blue LED Warning Strobe
   triggerLocalAlarm();
 
+  bool isBatCut = String(sourceName).indexOf("12V_BATTERY") >= 0;
+  String evtType = isBatCut ? "BATTERY_DISCONNECTED" : "TAMPER_DETECTED";
+
   String tamperPayload = "{";
   tamperPayload += "\"device_imei\":\"" + deviceImei + "\",";
   tamperPayload += "\"hardware_imei\":\"" + hardwareImei + "\",";
-  tamperPayload += "\"event_type\":\"TAMPER_DETECTED\",";
+  tamperPayload += "\"event_type\":\"" + evtType + "\",";
   tamperPayload += "\"sensor\":\"" + String(sourceName) + "\",";
   tamperPayload += "\"g_force\":" + String(gForce, 2) + ",";
   tamperPayload += "\"piezo_adc\":" + String(piezoAdcDelta) + ",";
+  tamperPayload += "\"latitude\":" + String(gnss.latitude, 6) + ",";
+  tamperPayload += "\"longitude\":" + String(gnss.longitude, 6) + ",";
   tamperPayload += "\"plate\":\"" + bikePlate + "\",";
   tamperPayload += "\"alert_phone\":\"" + alertPhoneLocal + "\",";
   tamperPayload += "\"timestamp\":" + String(millis());
@@ -1393,8 +1386,11 @@ void triggerTamperAlert(float gForce, int piezoAdcDelta, const char* sourceName)
   // 3. Send Instant 100% Offline Direct Tamper SMS FIRST (before Class-B GPRS MQTT TBF burst!)
   sendTamperSmsAlert(gForce, piezoAdcDelta, sourceName);
 
-  // 4. Then publish over MTN Uganda Cellular MQTT for optional live map sync
+  // 4. Then publish over MTN Uganda Cellular MQTT for live map & server sync
   sim7000PublishMqtt(TOPIC_TAMPER, tamperPayload);
+
+  // 5. Place Emergency Voice Call to registered owner phone
+  placeTamperVoiceCall(sourceName);
 }
 
 /**

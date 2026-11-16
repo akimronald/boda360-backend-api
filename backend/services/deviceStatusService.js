@@ -1,31 +1,29 @@
 /**
  * Real-Time Hardware Device Online / Offline Heartbeat Watchdog Service
  *
- * Tracks live connectivity of physical ESP32 + SIM7000G tracker nodes across:
+ * Tracks live connectivity of physical ESP32 + SIM7000G / SIM800L tracker nodes across:
  *   1. USB Serial Bridge (`COM7` — 3s telemetry cadence)
  *   2. Wireless MTN/Airtel Cellular MQTT (`broker.hivemq.com` — 3s telemetry / tamper packets)
- *
- * Handles both:
- *   - Instant USB cable disconnect (`handleUsbDisconnected` -> immediate OFFLINE unless Cellular MQTT is active)
- *   - Onboard power-switch OFF / battery depletion / GSM signal loss (`9.5s` missed-heartbeat watchdog)
  */
 
 const db = require('../config/db');
 
-const DEFAULT_IMEI = '865421045981201';
+const DEFAULT_IMEI = '869951038535641';
 const DEFAULT_PLATE = 'UEV 412K';
-const HEARTBEAT_TIMEOUT_MS = 9500; // ~3 missed 3-second hardware heartbeats
+const HEARTBEAT_TIMEOUT_MS = 25000; // 25s window prevents false offline flicker during cellular/sleep intervals
 
 let broadcastCallback = null;
 let watchdogTimer = null;
+let lastActiveHardwareImei = DEFAULT_IMEI;
 
 const devices = new Map();
 
 function ensureDevice(imei = DEFAULT_IMEI, plate = DEFAULT_PLATE) {
-  if (!devices.has(imei)) {
-    devices.set(imei, {
-      imei,
-      plate,
+  const cleanImei = String(imei || DEFAULT_IMEI).trim();
+  if (!devices.has(cleanImei)) {
+    devices.set(cleanImei, {
+      imei: cleanImei,
+      plate: plate || DEFAULT_PLATE,
       is_online: false,
       usb_connected: false,
       transport: 'OFFLINE',
@@ -37,8 +35,8 @@ function ensureDevice(imei = DEFAULT_IMEI, plate = DEFAULT_PLATE) {
       ever_connected: false
     });
   }
-  const entry = devices.get(imei);
-  if (plate && plate !== DEFAULT_PLATE) {
+  const entry = devices.get(cleanImei);
+  if (plate && plate !== DEFAULT_PLATE && plate !== 'UNBOUND') {
     entry.plate = plate;
   }
   return entry;
@@ -47,13 +45,14 @@ function ensureDevice(imei = DEFAULT_IMEI, plate = DEFAULT_PLATE) {
 function syncMotorcycleStore(entry) {
   try {
     if (db.store && Array.isArray(db.store.motorcycles)) {
-      const moto = db.store.motorcycles.find((m) => m.device_imei === entry.imei);
-      if (moto) {
-        moto.is_online = entry.is_online;
-        moto.connection_transport = entry.transport;
-        moto.last_seen_at = entry.last_seen_at;
-        moto.offline_since = entry.offline_since;
-      }
+      db.store.motorcycles.forEach((moto) => {
+        if (moto.device_imei === entry.imei || db.store.motorcycles.length === 1) {
+          moto.is_online = entry.is_online;
+          moto.connection_transport = entry.transport;
+          moto.last_seen_at = entry.last_seen_at;
+          moto.offline_since = entry.offline_since;
+        }
+      });
     }
   } catch (_) {}
 }
@@ -94,9 +93,7 @@ function markOffline(entry, reason = 'HEARTBEAT_TIMEOUT') {
   broadcastDeviceStatus(entry);
 }
 
-function recordHeartbeat(imei = DEFAULT_IMEI, transport = 'USB_SERIAL', plate = DEFAULT_PLATE) {
-  const entry = ensureDevice(imei || DEFAULT_IMEI, plate || DEFAULT_PLATE);
-  const now = Date.now();
+function applyHeartbeatToEntry(entry, transport, now) {
   const wasOnline = entry.is_online;
   const prevTransport = entry.transport;
 
@@ -112,8 +109,7 @@ function recordHeartbeat(imei = DEFAULT_IMEI, transport = 'USB_SERIAL', plate = 
     entry.last_mqtt_ms = now;
   }
 
-  // Prefer displaying USB_SERIAL if serial had a packet in the last 6s, else CELLULAR_MQTT
-  entry.transport = (now - entry.last_serial_ms < 6000) ? 'USB_SERIAL' : transport;
+  entry.transport = (now - entry.last_serial_ms < 8000) ? 'USB_SERIAL' : transport;
   entry.is_online = true;
 
   syncMotorcycleStore(entry);
@@ -124,13 +120,37 @@ function recordHeartbeat(imei = DEFAULT_IMEI, transport = 'USB_SERIAL', plate = 
   }
 }
 
-function handleUsbDisconnected(imei = DEFAULT_IMEI) {
-  const entry = ensureDevice(imei || DEFAULT_IMEI);
+function recordHeartbeat(imei = DEFAULT_IMEI, transport = 'USB_SERIAL', plate = DEFAULT_PLATE) {
+  const cleanImei = String(imei || lastActiveHardwareImei || DEFAULT_IMEI).trim();
+  lastActiveHardwareImei = cleanImei;
+  const now = Date.now();
+
+  const entry = ensureDevice(cleanImei, plate || DEFAULT_PLATE);
+  applyHeartbeatToEntry(entry, transport, now);
+
+  // Also mirror heartbeat to any customer-registered motorcycle if it is linked to this hardware
+  try {
+    if (db.store && Array.isArray(db.store.motorcycles)) {
+      db.store.motorcycles.forEach((m) => {
+        if (m && m.device_imei && m.device_imei !== cleanImei && db.store.motorcycles.length === 1) {
+          const linkedEntry = ensureDevice(m.device_imei, m.plate_number || DEFAULT_PLATE);
+          applyHeartbeatToEntry(linkedEntry, transport, now);
+        } else if (m && m.device_imei === cleanImei && m.plate_number) {
+          entry.plate = m.plate_number;
+        }
+      });
+    }
+  } catch (_) {}
+}
+
+function handleUsbDisconnected(imei) {
+  const targetImei = imei || lastActiveHardwareImei || DEFAULT_IMEI;
+  const entry = ensureDevice(targetImei);
   entry.usb_connected = false;
   const now = Date.now();
 
-  // If wireless Cellular MQTT is actively streaming (< 7s ago), stay online via CELLULAR_MQTT
-  if (entry.last_mqtt_ms > 0 && (now - entry.last_mqtt_ms) < 7000) {
+  // If wireless Cellular MQTT is actively streaming (< 15s ago), stay online via CELLULAR_MQTT
+  if (entry.last_mqtt_ms > 0 && (now - entry.last_mqtt_ms) < 15000) {
     entry.transport = 'CELLULAR_MQTT';
     broadcastDeviceStatus(entry);
     return;
@@ -144,7 +164,6 @@ function startWatchdog(broadcast) {
     broadcastCallback = broadcast;
   }
 
-  ensureDevice(DEFAULT_IMEI, DEFAULT_PLATE);
   try {
     if (db.store && Array.isArray(db.store.motorcycles)) {
       db.store.motorcycles.forEach((m) => {
@@ -166,28 +185,39 @@ function startWatchdog(broadcast) {
         markOffline(entry, 'NO_TELEMETRY_HEARTBEAT');
       }
     }
-  }, 2000);
+  }, 2500);
 }
 
 function registerDevice(imei, plate) {
   if (!imei) return null;
   const entry = ensureDevice(imei, plate || DEFAULT_PLATE);
+  // If physical hardware is currently online, immediately link its online state to this newly registered bike
+  const activeHw = devices.get(lastActiveHardwareImei);
+  if (activeHw && activeHw.is_online && (Date.now() - activeHw.last_seen_ms < HEARTBEAT_TIMEOUT_MS)) {
+    applyHeartbeatToEntry(entry, activeHw.transport, Date.now());
+  }
   syncMotorcycleStore(entry);
   return buildStatusPayload(entry);
 }
 
 function unregisterDevice(imei) {
-  if (!imei || imei === DEFAULT_IMEI) return;
+  if (!imei) return;
   devices.delete(imei);
 }
 
-function getDeviceStatus(imei = DEFAULT_IMEI) {
-  const entry = ensureDevice(imei || DEFAULT_IMEI);
-  return buildStatusPayload(entry);
+function getDeviceStatus(imei) {
+  const targetImei = imei || lastActiveHardwareImei || DEFAULT_IMEI;
+  if (devices.has(targetImei)) {
+    return buildStatusPayload(devices.get(targetImei));
+  }
+  const activeHw = devices.get(lastActiveHardwareImei);
+  if (activeHw && activeHw.is_online) {
+    return buildStatusPayload(activeHw);
+  }
+  return buildStatusPayload(ensureDevice(targetImei));
 }
 
 function getAllDeviceStatuses() {
-  ensureDevice(DEFAULT_IMEI, DEFAULT_PLATE);
   try {
     if (db.store && Array.isArray(db.store.motorcycles)) {
       db.store.motorcycles.forEach((m) => {
@@ -200,6 +230,10 @@ function getAllDeviceStatuses() {
   return Array.from(devices.values()).map((entry) => buildStatusPayload(entry));
 }
 
+function getLastActiveHardwareImei() {
+  return lastActiveHardwareImei;
+}
+
 module.exports = {
   startWatchdog,
   recordHeartbeat,
@@ -208,6 +242,6 @@ module.exports = {
   unregisterDevice,
   getDeviceStatus,
   getAllDeviceStatuses,
+  getLastActiveHardwareImei,
   HEARTBEAT_TIMEOUT_MS
 };
-

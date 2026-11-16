@@ -16,6 +16,7 @@ let broadcastCallback = null;
 let isConnected = false;
 let portName = process.env.ESP32_PORT || 'COM7';
 let baudRate = 115200;
+let lastSerialImei = '869951038535641';
 
 function getScriptsDir() {
   const localDir = path.join(__dirname, '..', 'scripts');
@@ -104,37 +105,77 @@ function processSerialLine(line) {
   if (jsonMatch) {
     try {
       const payload = JSON.parse(jsonMatch[0]);
-      deviceStatusService.recordHeartbeat(payload.device_imei || '865421045981201', 'USB_SERIAL');
+      if (payload.device_imei) {
+        lastSerialImei = String(payload.device_imei).trim();
+      }
+      const matchedMoto = db.store.motorcycles.find(m => m.device_imei === lastSerialImei) || db.store.motorcycles[0];
+      deviceStatusService.recordHeartbeat(
+        lastSerialImei,
+        'USB_SERIAL',
+        matchedMoto ? matchedMoto.plate_number : (payload.plate || 'UEV 412K')
+      );
+
+      // Auto-register hardware unit in db.store.devices if not present
+      if (db.store && Array.isArray(db.store.devices) && lastSerialImei) {
+        let dev = db.store.devices.find(d => d.device_imei === lastSerialImei);
+        if (!dev) {
+          dev = {
+            device_id: db.store.devices.length + 1,
+            device_imei: lastSerialImei,
+            serial_number: `SN-USB-${lastSerialImei.slice(-6)}`,
+            batch_id: 'BATCH-AUTO-DISCOVERED',
+            board_type: payload.board_type || 'lilygo_tsim7000g',
+            hardware_version: 'ESP32 LILYGO T-SIM7000G',
+            firmware_version: payload.fw_version ? 'v' + String(payload.fw_version).replace(/^v/i, '') : 'v2.3.0',
+            vendor_id: 1,
+            status: matchedMoto ? 'activated_to_customer' : 'available_online',
+            qa_passed: true,
+            manufactured_at: new Date(),
+            allocated_at: new Date(),
+            activated_at: matchedMoto ? new Date() : null
+          };
+          db.store.devices.push(dev);
+        }
+      }
+
       if (payload.command_action) {
         console.log(`✅ [Hardware ACK Received]: Action ${payload.command_action} -> Status ${payload.status}`);
+        if (matchedMoto) {
+          if (payload.command_action === 'ENGINE_CUT') matchedMoto.status = 'immobilized';
+          else if (payload.command_action === 'ENGINE_RESTORE') matchedMoto.status = 'active';
+        }
         if (broadcastCallback) {
           broadcastCallback({
             type: 'COMMAND_ACKNOWLEDGED',
             command: {
-              device_imei: payload.device_imei,
+              device_imei: matchedMoto ? matchedMoto.device_imei : payload.device_imei,
+              hardware_imei: payload.device_imei,
               command_action: payload.command_action,
               command_status: payload.status
             }
           });
         }
       } else if (payload.event_type) {
-        const imei = payload.device_imei;
-        const moto = db.store.motorcycles.find(m => m.device_imei === imei) || db.store.motorcycles[0];
+        const imei = matchedMoto ? matchedMoto.device_imei : payload.device_imei;
+        const moto = matchedMoto;
         const latestTel = db.store.telemetry_logs
-          .filter(t => t.device_imei === imei)
+          .filter(t => t.device_imei === imei || t.device_imei === payload.device_imei)
           .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
 
         const gForce = parseFloat(payload.g_force || 3.8);
         const piezoAdc = payload.piezo_adc !== undefined ? ` (Piezo ADC: ${payload.piezo_adc}/4095)` : '';
         const isGeofence = payload.event_type === 'GEOFENCE_BREACH';
-        const isBatteryCut = payload.event_type === 'BATTERY_DISCONNECTED';
+        const isBatteryCut =
+          payload.event_type === 'BATTERY_DISCONNECTED' ||
+          String(payload.sensor || '').includes('12V_BATTERY');
+        const resolvedEventType = isBatteryCut ? 'BATTERY_DISCONNECTED' : payload.event_type;
 
         // Deduplicate if wireless Cellular MQTT Bridge already logged this exact hardware event < 3.5s ago
         const latestExisting = db.store.security_events[0] || null;
         if (
           latestExisting &&
-          latestExisting.device_imei === imei &&
-          latestExisting.event_type === payload.event_type &&
+          (latestExisting.device_imei === imei || latestExisting.device_imei === payload.device_imei) &&
+          latestExisting.event_type === resolvedEventType &&
           (Date.now() - new Date(latestExisting.triggered_at).getTime() < 3500)
         ) {
           return;
@@ -153,7 +194,9 @@ function processSerialLine(line) {
         const newEvent = {
           event_id: db.store.security_events.length + 1,
           device_imei: imei,
-          event_type: payload.event_type,
+          hardware_imei: payload.device_imei,
+          plate_number: moto ? moto.plate_number : (payload.plate || 'UEV 412K'),
+          event_type: resolvedEventType,
           severity: isGeofence ? 'HIGH' : 'CRITICAL',
           latitude: payload.latitude !== undefined ? parseFloat(payload.latitude) : (latestTel ? latestTel.latitude : 0.184309),
           longitude: payload.longitude !== undefined ? parseFloat(payload.longitude) : (latestTel ? latestTel.longitude : 32.524229),
@@ -163,7 +206,7 @@ function processSerialLine(line) {
         };
 
         db.store.security_events.unshift(newEvent);
-        console.log(`🚨 [Hardware Security Event]: ${payload.event_type} | ${eventNotes}`);
+        console.log(`🚨 [Hardware Security Event]: ${resolvedEventType} | ${eventNotes}`);
 
         if (!isGeofence) {
           const cfg = voiceCallService.getLiveConfig ? voiceCallService.getLiveConfig() : {};
@@ -172,7 +215,7 @@ function processSerialLine(line) {
               phone: payload.alert_phone || '0748802162',
               plate: moto ? moto.plate_number : 'UEV 412K',
               gForce,
-              eventType: payload.event_type,
+              eventType: resolvedEventType,
               backupVoltage: parseFloat(payload.backup_voltage || 3.9),
               force: isBatteryCut
             });
@@ -183,6 +226,7 @@ function processSerialLine(line) {
           broadcastCallback({
             type: 'SECURITY_ALERT',
             imei,
+            hardware_imei: payload.device_imei,
             plate: moto ? moto.plate_number : 'UEV 412K',
             event: newEvent,
             is_real_hardware: true
@@ -197,7 +241,7 @@ function processSerialLine(line) {
       // Malformed JSON snippet
     }
   } else if (line.includes('[GPS STATUS]')) {
-    deviceStatusService.recordHeartbeat('865421045981201', 'USB_SERIAL');
+    deviceStatusService.recordHeartbeat(lastSerialImei, 'USB_SERIAL');
     console.log(`🛰️  ${line}`);
   } else if (
     line.includes('[SMS]') ||

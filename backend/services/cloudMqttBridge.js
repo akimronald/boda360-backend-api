@@ -257,19 +257,41 @@ function startCloudMqttBridge(broadcastCallback) {
               }
             }
 
-            // Broadcast OTA Firmware Flash Progress / Completion from ESP32 nodes
-            if (topicStr.endsWith('/ack') && payload.command_action && String(payload.command_action).startsWith('OTA_')) {
-              console.log(`🚀 [Wireless OTA ACK] IMEI ${imeiFromPayload} (${payload.board_type || 'ESP32'}): ${payload.command_action} -> ${payload.status}`);
-              if (broadcastCallback) {
-                broadcastCallback({
-                  type: 'OTA_STATUS_UPDATE',
-                  event: payload.command_action,
-                  status: payload.status,
-                  imei: imeiFromPayload,
-                  board: payload.board_type || null,
-                  fw_version: payload.fw_version || null,
-                  timestamp: new Date().toISOString()
-                });
+            const cb = broadcastCallback || activeBroadcastCallback;
+
+            // Broadcast OTA Firmware Flash Progress / Completion OR Engine Cut/Restore ACKs from ESP32 nodes
+            if (topicStr.endsWith('/ack') && payload.command_action) {
+              const cmdAct = String(payload.command_action);
+              if (cmdAct.startsWith('OTA_')) {
+                console.log(`🚀 [Wireless OTA ACK] IMEI ${imeiFromPayload} (${payload.board_type || 'ESP32'}): ${cmdAct} -> ${payload.status}`);
+                if (cb) {
+                  cb({
+                    type: 'OTA_STATUS_UPDATE',
+                    event: cmdAct,
+                    status: payload.status,
+                    imei: imeiFromPayload,
+                    board: payload.board_type || null,
+                    fw_version: payload.fw_version || null,
+                    timestamp: new Date().toISOString()
+                  });
+                }
+              } else if (cmdAct === 'ENGINE_CUT' || cmdAct === 'ENGINE_RESTORE') {
+                const moto = matchedMoto || (db.store && db.store.motorcycles && db.store.motorcycles[0]) || null;
+                if (moto) {
+                  moto.status = cmdAct === 'ENGINE_CUT' ? 'immobilized' : 'active';
+                }
+                console.log(`✅ [Wireless MQTT ACK] IMEI ${imeiFromPayload}: ${cmdAct} -> ${payload.status}`);
+                if (cb) {
+                  cb({
+                    type: 'COMMAND_ACKNOWLEDGED',
+                    command: {
+                      device_imei: moto ? moto.device_imei : imeiFromPayload,
+                      hardware_imei: imeiFromPayload,
+                      command_action: cmdAct,
+                      command_status: payload.status || 'EXECUTED'
+                    }
+                  });
+                }
               }
             }
 
@@ -286,7 +308,8 @@ function startCloudMqttBridge(broadcastCallback) {
                 const parsedBat = payload.battery_voltage !== undefined ? parseFloat(payload.battery_voltage) : 12.6;
                 const newLog = {
                   log_id: (db.store && db.store.telemetry_logs ? db.store.telemetry_logs.length : 0) + 1,
-                  device_imei: imeiFromPayload,
+                  device_imei: moto ? moto.device_imei : imeiFromPayload,
+                  hardware_imei: imeiFromPayload,
                   latitude: parseFloat(payload.latitude),
                   longitude: parseFloat(payload.longitude),
                   speed: parseFloat(payload.speed || 0),
@@ -300,14 +323,18 @@ function startCloudMqttBridge(broadcastCallback) {
                   gps_lock: Boolean(payload.gps_lock),
                   timestamp: new Date()
                 };
+                if (moto) {
+                  moto.status = newLog.is_immobilized ? 'immobilized' : 'active';
+                }
                 if (db.store && Array.isArray(db.store.telemetry_logs)) {
                   db.store.telemetry_logs.push(newLog);
                 }
-                if (broadcastCallback) {
-                  broadcastCallback({
+                if (cb) {
+                  cb({
                     type: 'TELEMETRY_UPDATE',
-                    imei: imeiFromPayload,
-                    plate: moto ? moto.plate_number : 'UEV 412K',
+                    imei: moto ? moto.device_imei : imeiFromPayload,
+                    hardware_imei: imeiFromPayload,
+                    plate: moto ? moto.plate_number : (payload.plate || 'UEV 412K'),
                     telemetry: newLog,
                     status: moto ? moto.status : 'active',
                     is_real_hardware: true,
@@ -322,19 +349,23 @@ function startCloudMqttBridge(broadcastCallback) {
               payload.event_type === 'BATTERY_DISCONNECTED' ||
               payload.event_type === 'GEOFENCE_BREACH'
             ) {
-              const imei = payload.device_imei || '865421045981201';
-              const isBatteryCut = payload.event_type === 'BATTERY_DISCONNECTED';
+              const rawImei = payload.device_imei || imeiFromPayload || '869951038535641';
+              const isBatteryCut =
+                payload.event_type === 'BATTERY_DISCONNECTED' ||
+                String(payload.sensor || '').includes('12V_BATTERY');
               const isGeofence = payload.event_type === 'GEOFENCE_BREACH';
+              const resolvedEventType = isBatteryCut ? 'BATTERY_DISCONNECTED' : payload.event_type;
               const moto = (db.store && db.store.motorcycles)
-                ? (db.store.motorcycles.find(m => m.device_imei === imei) || db.store.motorcycles[0])
+                ? (db.store.motorcycles.find(m => m.device_imei === rawImei) || db.store.motorcycles[0])
                 : null;
-              const plate = moto ? moto.plate_number : 'UEV 412K';
+              const imei = moto ? moto.device_imei : rawImei;
+              const plate = moto ? moto.plate_number : (payload.plate || 'UEV 412K');
 
               // Deduplicate if USB Serial Gateway already logged this exact hardware event < 3.5s ago
               const latestExisting = (db.store && db.store.security_events && db.store.security_events[0]) || null;
               const isDuplicate = latestExisting &&
-                latestExisting.device_imei === imei &&
-                latestExisting.event_type === payload.event_type &&
+                (latestExisting.device_imei === imei || latestExisting.device_imei === rawImei) &&
+                latestExisting.event_type === resolvedEventType &&
                 (Date.now() - new Date(latestExisting.triggered_at).getTime() < 3500);
 
               if (isDuplicate) {
@@ -356,7 +387,7 @@ function startCloudMqttBridge(broadcastCallback) {
                     phone: payload.alert_phone || '0748802162',
                     plate,
                     gForce: parseFloat(payload.g_force || 4.2),
-                    eventType: payload.event_type,
+                    eventType: resolvedEventType,
                     backupVoltage: parseFloat(payload.backup_voltage || 3.9),
                     force: isBatteryCut
                   });
@@ -365,7 +396,7 @@ function startCloudMqttBridge(broadcastCallback) {
 
               const latestTel = (db.store && db.store.telemetry_logs)
                 ? db.store.telemetry_logs
-                    .filter(t => t.device_imei === imei)
+                    .filter(t => t.device_imei === imei || t.device_imei === rawImei)
                     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0]
                 : null;
 
@@ -378,7 +409,9 @@ function startCloudMqttBridge(broadcastCallback) {
               const newEvent = {
                 event_id: (db.store && db.store.security_events ? db.store.security_events.length : 0) + 1,
                 device_imei: imei,
-                event_type: payload.event_type,
+                hardware_imei: rawImei,
+                plate_number: plate,
+                event_type: resolvedEventType,
                 severity: isGeofence ? 'HIGH' : 'CRITICAL',
                 latitude: payload.latitude !== undefined ? parseFloat(payload.latitude) : (latestTel ? latestTel.latitude : 0.184309),
                 longitude: payload.longitude !== undefined ? parseFloat(payload.longitude) : (latestTel ? latestTel.longitude : 32.524292),
@@ -394,10 +427,11 @@ function startCloudMqttBridge(broadcastCallback) {
                 db.store.security_events.unshift(newEvent);
               }
 
-              if (broadcastCallback) {
-                broadcastCallback({
+              if (cb) {
+                cb({
                   type: 'SECURITY_ALERT',
                   imei,
+                  hardware_imei: rawImei,
                   plate,
                   is_real_hardware: true,
                   event: newEvent
