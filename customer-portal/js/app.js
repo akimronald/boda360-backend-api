@@ -1128,6 +1128,7 @@
 
   // --- INITIALIZATION ---
   document.addEventListener('DOMContentLoaded', () => {
+    hydrateInitialLocalMotorcycles();
     initLeafletMap();
     initNavigationSidebar();
     initHeaderControls();
@@ -2284,20 +2285,23 @@
         <div class="card-top-row">
           <div class="card-title-group">
             <span class="dot-status ${statusDotClass}"></span>
-            <span class="card-model-name">${bike.model}</span>
+            <span class="card-model-name">${escapeHtml(bike.model)}</span>
           </div>
-          ${isOffline
-            ? `<span class="card-offline-badge"><i class="fa-solid fa-plug-circle-xmark"></i> OFFLINE</span>`
-            : `<span class="card-plate-tag">${bike.plate}</span>`}
+          <div style="display: inline-flex; align-items: center; gap: 6px;">
+            <span class="card-plate-tag">${escapeHtml(bike.plate)}</span>
+            <button type="button" class="btn-card-delete-bike" data-imei="${escapeHtml(bike.imei)}" data-plate="${escapeHtml(bike.plate)}" title="Delete ${escapeHtml(bike.plate)} from your bike list" aria-label="Delete motorcycle ${escapeHtml(bike.plate)}" style="border: 1px solid #fecaca; background: #fff5f5; color: #dc2626; width: 24px; height: 24px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 0.72rem;">
+              <i class="fa-solid fa-trash-can"></i>
+            </button>
+          </div>
         </div>
         <div class="card-data-snippets">
           <div class="snippet-item">
             <span class="snippet-label">${isOffline ? 'Status' : 'Speed'}</span>
-            <span class="snippet-val ${speedClass}">${isOffline ? 'Disconnected' : `${bike.speed.toFixed(1)} km/h`}</span>
+            <span class="snippet-val ${speedClass}">${isOffline ? 'Offline' : `${bike.speed.toFixed(1)} km/h`}</span>
           </div>
           <div class="snippet-item">
-            <span class="snippet-label">${isOffline ? 'Last Seen' : 'Shift Odo'}</span>
-            <span class="snippet-val">${isOffline ? formatDeviceLastSeen(bike) : `+${bike.shiftDistance.toFixed(1)} km`}</span>
+            <span class="snippet-label">IMEI</span>
+            <span class="snippet-val" style="font-family: var(--font-mono); font-size: 0.7rem;">${escapeHtml(String(bike.imei || '').slice(-8))}</span>
           </div>
           <div class="snippet-item">
             <span class="snippet-label">Battery</span>
@@ -2305,6 +2309,14 @@
           </div>
         </div>
       `;
+
+      const delBtn = card.querySelector('.btn-card-delete-bike');
+      if (delBtn) {
+        delBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          promptAndDeleteBike(bike.imei, bike.plate);
+        });
+      }
 
       card.addEventListener('click', () => {
         selectBike(originalIndex);
@@ -4801,7 +4813,19 @@
   function buildAuthHeaders(extra = {}) {
     const token = localStorage.getItem('boda_auth_token');
     const email = localStorage.getItem('boda_user_email') || '';
-    const headers = { ...(email ? { 'x-user-email': email } : {}), ...extra };
+    let userName = '';
+    let userPhone = '';
+    try {
+      const prof = JSON.parse(localStorage.getItem('boda_user_profile') || '{}');
+      userName = prof.full_name || '';
+      userPhone = prof.phone_number || '';
+    } catch (_) {}
+    const headers = {
+      ...(email ? { 'x-user-email': email } : {}),
+      ...(userName ? { 'x-user-name': userName } : {}),
+      ...(userPhone ? { 'x-user-phone': userPhone } : {}),
+      ...extra
+    };
     if (token) headers['Authorization'] = `Bearer ${token}`;
     return headers;
   }
@@ -4867,13 +4891,48 @@
     }
   }
 
+  function getDeletedImeisSet() {
+    try {
+      const raw = localStorage.getItem('boda_deleted_imeis');
+      const arr = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(arr) ? arr : []);
+    } catch (_) {
+      return new Set();
+    }
+  }
+
+  function markImeiDeleted(imei) {
+    try {
+      const set = getDeletedImeisSet();
+      set.add(String(imei));
+      localStorage.setItem('boda_deleted_imeis', JSON.stringify(Array.from(set)));
+    } catch (_) {}
+  }
+
+  function unmarkImeiDeleted(imei) {
+    try {
+      const set = getDeletedImeisSet();
+      if (set.has(String(imei))) {
+        set.delete(String(imei));
+        localStorage.setItem('boda_deleted_imeis', JSON.stringify(Array.from(set)));
+      }
+    } catch (_) {}
+  }
+
   function getLocalSavedMotorcyclesForUser() {
     try {
-      const email = (localStorage.getItem('boda_user_email') || '').toLowerCase();
+      const email = (localStorage.getItem('boda_user_email') || '').trim().toLowerCase();
+      const deletedSet = getDeletedImeisSet();
       const raw = localStorage.getItem('boda_local_motorcycles');
-      const all = raw ? JSON.parse(raw) : [];
-      if (!Array.isArray(all)) return [];
-      return email ? all.filter(m => String(m.owner_email || '').toLowerCase() === email) : all;
+      const parsed = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(parsed)) return [];
+      const activeList = parsed.filter(m => m && m.device_imei && !deletedSet.has(String(m.device_imei)));
+      if (!email) return activeList;
+      const ownedOrUnassigned = activeList.filter(m => {
+        const mEmail = String(m.owner_email || '').trim().toLowerCase();
+        return !mEmail || mEmail === email;
+      });
+      return ownedOrUnassigned.length > 0 ? ownedOrUnassigned : activeList;
     } catch (_) {
       return [];
     }
@@ -4881,25 +4940,55 @@
 
   function saveLocalMotorcycleForUser(serverMoto) {
     try {
-      const email = (localStorage.getItem('boda_user_email') || '').toLowerCase();
+      if (!serverMoto || !serverMoto.device_imei) return;
+      unmarkImeiDeleted(serverMoto.device_imei);
+      const email = (localStorage.getItem('boda_user_email') || '').trim().toLowerCase();
       const raw = localStorage.getItem('boda_local_motorcycles');
-      const all = Array.isArray(raw ? JSON.parse(raw) : []) ? JSON.parse(raw) : [];
-      const filtered = all.filter(m => m.device_imei !== serverMoto.device_imei);
-      filtered.push({ ...serverMoto, owner_email: serverMoto.owner_email || email });
+      const parsed = raw ? JSON.parse(raw) : [];
+      const all = Array.isArray(parsed) ? parsed : [];
+      const filtered = all.filter(m => m && m.device_imei !== serverMoto.device_imei);
+      filtered.push({ ...serverMoto, owner_email: email || serverMoto.owner_email || '' });
       localStorage.setItem('boda_local_motorcycles', JSON.stringify(filtered));
     } catch (_) {}
   }
 
   function removeLocalMotorcycleForUser(imei) {
     try {
+      markImeiDeleted(imei);
       const raw = localStorage.getItem('boda_local_motorcycles');
-      const all = Array.isArray(raw ? JSON.parse(raw) : []) ? JSON.parse(raw) : [];
-      const filtered = all.filter(m => m.device_imei !== imei);
+      const parsed = raw ? JSON.parse(raw) : [];
+      const all = Array.isArray(parsed) ? parsed : [];
+      const filtered = all.filter(m => m && m.device_imei !== imei);
       localStorage.setItem('boda_local_motorcycles', JSON.stringify(filtered));
     } catch (_) {}
   }
 
+  function hydrateInitialLocalMotorcycles() {
+    const localSaved = getLocalSavedMotorcyclesForUser();
+    if (localSaved.length > 0) {
+      state.bikes = localSaved.map(m => mapServerMotorcycleToClientBike(m, null));
+      state.activeBikeIndex = 0;
+    }
+  }
+
+  async function promptAndDeleteBike(imei, plate) {
+    if (!window.confirm(`Remove motorcycle ${plate} (IMEI: ${imei}) from your list of bikes?`)) {
+      return;
+    }
+    removeMotorcycleFromState(imei);
+    showTerritoryToast('🗑️', 'MOTORCYCLE REMOVED', `${plate} was removed from your list of bikes.`);
+    try {
+      await fetchPortalWithTimeout(`/api/motorcycles/${encodeURIComponent(imei)}`, {
+        method: 'DELETE',
+        headers: buildAuthHeaders()
+      }, 3500);
+    } catch (_) {}
+  }
+
   async function fetchUserMotorcycles() {
+    const deletedSet = getDeletedImeisSet();
+    let serverMotos = [];
+
     try {
       const res = await fetchPortalWithTimeout('/api/motorcycles', {
         headers: buildAuthHeaders(),
@@ -4908,55 +4997,68 @@
       if (res.ok) {
         const data = await res.json();
         if (data && data.success && Array.isArray(data.motorcycles)) {
-          if (data.motorcycles.length > 0) {
-            const selectedImei = state.bikes[state.activeBikeIndex]
-              ? state.bikes[state.activeBikeIndex].imei
-              : null;
-
-            const mapped = data.motorcycles.map(m => {
-              saveLocalMotorcycleForUser(m);
-              const existing = state.bikes.find(b => b.imei === m.device_imei);
-              return mapServerMotorcycleToClientBike(m, existing);
-            });
-
-            clearAllMarkersAndPolylines();
-            state.bikes = mapped;
-            const restoredIdx = selectedImei ? state.bikes.findIndex(b => b.imei === selectedImei) : 0;
-            state.activeBikeIndex = restoredIdx >= 0 ? restoredIdx : 0;
-
-            renderAllVehicleMarkers();
-            renderAssetList();
-            renderSelectedPayload();
-            updateDockHUD();
-            renderProfileBikesList();
-            fetchHardwareDeviceStatus(false);
-            return;
-          } else {
-            const localSaved = getLocalSavedMotorcyclesForUser();
-            if (localSaved.length === 0) {
-              clearAllMarkersAndPolylines();
-              state.bikes = [];
-              state.activeBikeIndex = 0;
-              syncDeviceOnlineOfflineUI(null);
-              renderProfileBikesList();
-              return;
-            }
-          }
+          serverMotos = data.motorcycles.filter(m => m && m.device_imei && !deletedSet.has(String(m.device_imei)));
         }
       }
     } catch (_) {}
 
-    // Offline / static-site fallback: load any motorcycles saved locally by this user
+    // Merge server motorcycles with locally saved motorcycles so added bikes NEVER disappear unless deleted!
     const localSaved = getLocalSavedMotorcyclesForUser();
+    const mergedByImei = new Map();
+
+    serverMotos.forEach(m => {
+      saveLocalMotorcycleForUser(m);
+      mergedByImei.set(String(m.device_imei), m);
+    });
+
+    localSaved.forEach(localMoto => {
+      const key = String(localMoto.device_imei);
+      if (!mergedByImei.has(key) && !deletedSet.has(key)) {
+        mergedByImei.set(key, localMoto);
+        // Sync local-only motorcycle back to the server in the background
+        fetchPortalWithTimeout('/api/motorcycles', {
+          method: 'POST',
+          headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({
+            plate_number: localMoto.plate_number,
+            device_imei: localMoto.device_imei,
+            model: localMoto.model,
+            sim_number: localMoto.sim_number,
+            pin_code: localMoto.pin_code || '1234',
+            location_name: localMoto.location_name,
+            latitude: localMoto.latest_telemetry ? localMoto.latest_telemetry.latitude : undefined,
+            longitude: localMoto.latest_telemetry ? localMoto.latest_telemetry.longitude : undefined
+          })
+        }, 3500).catch(() => {});
+      }
+    });
+
+    const combinedList = Array.from(mergedByImei.values());
+    const selectedImei = state.bikes[state.activeBikeIndex]
+      ? state.bikes[state.activeBikeIndex].imei
+      : null;
+
     clearAllMarkersAndPolylines();
-    state.bikes = localSaved.map(m => mapServerMotorcycleToClientBike(m, null));
-    state.activeBikeIndex = 0;
+    state.bikes = combinedList.map(m => {
+      const existing = state.bikes.find(b => b.imei === m.device_imei);
+      return mapServerMotorcycleToClientBike(m, existing);
+    });
+
+    const restoredIdx = selectedImei ? state.bikes.findIndex(b => b.imei === selectedImei) : 0;
+    state.activeBikeIndex = restoredIdx >= 0 ? restoredIdx : 0;
+
     renderAllVehicleMarkers();
     renderAssetList();
     renderSelectedPayload();
     updateDockHUD();
     renderProfileBikesList();
     syncMultiBikeCountersAndDropdowns();
+
+    if (state.bikes.length > 0) {
+      fetchHardwareDeviceStatus(false);
+    } else {
+      syncDeviceOnlineOfflineUI(null);
+    }
   }
 
   function upsertServerMotorcycleInState(serverMoto, shouldFocusNewBike) {
@@ -5363,8 +5465,6 @@
             closeModal('modal-add-bike');
             if (audio) audio.playChirp(true);
             showTerritoryToast('🏍️', 'TRACKER & BIKE ACTIVATED', `${plate} (${data.motorcycle.model || model}) is now linked to your account and pinned on the map!`);
-          } else if (res.status === 400 || res.status === 409) {
-            showAddBikeFeedback('error', (data && data.message) || 'Could not register motorcycle. Check Plate or IMEI.');
           } else {
             throw new Error('Fallback to local bike activation');
           }
