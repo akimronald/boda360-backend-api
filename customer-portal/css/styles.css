@@ -5686,6 +5686,377 @@ input[type="file"].hidden,
   }
 }
 
+/* =========================================================================
+   UNIVERSAL MULTI-DEVICE RESPONSIVE FIT (ALL SCREENS, PHONES, TABLETS, LAPTOPS)
+   ========================================================================= */
+
+/* 1. Dynamic Viewport Height (100dvh) so mobile browser address bars never clip bottom controls */
+.app-layout,
+.left-nav-sidebar,
+.central-map-workspace,
+.right-telemetry-sidebar {
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* 2. Right Telemetry Sidebar & Left Navigation Sidebar Scroll Resilience on Any Screen Height */
+.right-telemetry-sidebar {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.right-telemetry-sidebar .sidebar-header-controls,
+.right-telemetry-sidebar .sidebar-danger-box {
+  flex-shrink: 0;
+}
+
+.right-telemetry-sidebar .dynamic-asset-list {
+  flex: 1 0 auto;
+  min-height: 175px;
+  max-height: none;
+  overflow-y: visible;
+}
+
+.right-telemetry-sidebar .selected-payload-card {
+  flex-shrink: 0;
+  margin-top: auto;
+}
+
+.left-nav-sidebar {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.left-nav-sidebar .nav-menu {
+  flex: 1 0 auto;
+  min-height: 220px;
+}
+
+/* 3. Medium Laptops & Split-Screen Desktops (1025px - 1480px)
+      Prevents Map Floating Header & Bottom Security Dock from overflowing the center map column */
+@media (min-width: 1025px) and (max-width: 1480px) {
+  .left-nav-sidebar {
+    width: 190px;
+    min-width: 190px;
+    max-width: 190px;
+  }
+
+  .right-telemetry-sidebar {
+    width: 325px;
+    min-width: 325px;
+    max-width: 325px;
+  }
+
+  .map-floating-header {
+    top: 12px;
+    left: 12px;
+    right: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .map-search-container {
+    flex: 1 1 210px;
+    width: auto;
+    min-width: 180px;
+  }
+
+  .location-selector-container {
+    flex: 1 1 210px;
+    min-width: 180px;
+  }
+
+  .country-location-select {
+    width: 100%;
+    max-width: 190px;
+    text-overflow: ellipsis;
+  }
+
+  .map-action-controls {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .map-ctrl-btn {
+    padding: 6px 9px;
+    font-size: 0.76rem;
+  }
+
+  .map-ctrl-btn span {
+    display: none;
+  }
+
+  .floating-security-dock {
+    left: 12px;
+    right: 12px;
+    bottom: 14px;
+    padding: 11px 14px;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+  }
+
+  .dock-left-meta {
+    flex: 1 1 260px;
+    min-width: 0;
+  }
+
+  .dock-telemetry-snippet {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    font-size: 0.74rem;
+  }
+
+  .dock-pipeline-status {
+    display: none;
+  }
+}
+
+/* 4. Universal Modal Fit across All Viewports & Short Screens */
+.modal-overlay {
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.modal-card,
+.modal-card.modal-lg,
+.modal-card.modal-xl,
+.modal-card.modal-profile-card,
+#modal-add-bike .modal-card,
+#modal-customer-signup .modal-card {
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header,
+.modal-footer {
+  flex-shrink: 0;
+}
+
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 5. Tablets & Mobile Touch Viewports (<= 1024px) */
+@media (max-width: 1024px) {
+  .central-map-workspace {
+    height: calc(100vh - 56px);
+    height: calc(100dvh - 56px);
+  }
+
+  .left-nav-sidebar,
+  .right-telemetry-sidebar {
+    height: 100vh;
+    height: 100dvh;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .mobile-app-bar {
+    gap: 8px;
+  }
+
+  .mobile-app-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .mobile-logo-txt {
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+}
+
+/* 6. Smartphones & Portrait Tablets (<= 768px) */
+@media (max-width: 768px) {
+  .modal-overlay {
+    padding: 8px;
+    align-items: center;
+  }
+
+  .modal-card,
+  .modal-card.modal-lg,
+  .modal-card.modal-xl,
+  .modal-card.modal-profile-card,
+  #modal-add-bike .modal-card,
+  #modal-customer-signup .modal-card {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100vh - 16px);
+    max-height: calc(100dvh - 16px);
+    border-radius: 14px;
+  }
+
+  .modal-header,
+  #modal-add-bike .modal-header {
+    padding: 12px 14px;
+  }
+
+  .modal-title-group h3 {
+    font-size: 0.98rem;
+    line-height: 1.25;
+  }
+
+  .modal-body,
+  #modal-add-bike .modal-body,
+  .profile-modal-body {
+    padding: 12px 14px;
+  }
+
+  .modal-footer,
+  #modal-add-bike .modal-footer {
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* Prevent iOS Safari zoom-on-focus by keeping form inputs >= 16px on touch screens */
+  .modal-body input.form-control,
+  .modal-body select.form-control,
+  .modal-body textarea.form-control,
+  .sidebar-filter-input,
+  .map-search-input {
+    font-size: 16px;
+  }
+
+  .floating-security-dock {
+    bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .profile-avatar-customizer {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .avatar-btn-row {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+}
+
+/* 7. Compact Smartphones (<= 480px) */
+@media (max-width: 480px) {
+  .central-map-workspace {
+    height: calc(100vh - 52px);
+    height: calc(100dvh - 52px);
+  }
+
+  .mobile-app-bar {
+    padding: 0 8px;
+    gap: 4px;
+  }
+
+  .mobile-app-title {
+    gap: 5px;
+  }
+
+  .mobile-logo-txt {
+    font-size: 0.82rem;
+  }
+
+  .mobile-device-status-pill {
+    padding: 2px 6px;
+    font-size: 0.58rem;
+  }
+
+  .mobile-app-bar .mobile-bar-btn {
+    width: 32px;
+    height: 32px;
+    font-size: 0.86rem;
+    border-radius: 8px;
+  }
+
+  .modal-footer,
+  #modal-add-bike .modal-footer {
+    flex-direction: row;
+  }
+
+  .modal-footer .btn,
+  #modal-add-bike .modal-footer .btn,
+  #btn-submit-add-bike {
+    flex: 1 1 auto;
+    justify-content: center;
+    padding: 10px 12px;
+    font-size: 0.82rem;
+  }
+
+  .payload-metrics-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .meta-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+
+  .sidebar-export-actions {
+    flex-direction: column;
+  }
+}
+
+/* 8. Ultra-Compact Phones (<= 360px) */
+@media (max-width: 360px) {
+  .mobile-logo-txt {
+    font-size: 0.75rem;
+  }
+
+  .mobile-app-bar .mobile-bar-btn {
+    width: 29px;
+    height: 29px;
+    font-size: 0.8rem;
+  }
+
+  .payload-metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 9. Landscape Mobile Phones (Short Viewport Height <= 540px) */
+@media (max-height: 540px) and (max-width: 960px) {
+  .map-floating-header {
+    top: 4px;
+    flex-direction: row;
+    flex-wrap: nowrap;
+  }
+
+  .map-search-container {
+    width: 210px;
+    height: 32px;
+  }
+
+  .floating-security-dock {
+    padding: 6px 10px;
+    flex-direction: row;
+    align-items: center;
+    bottom: 6px;
+  }
+
+  .dock-security-actions {
+    width: auto;
+    flex-shrink: 0;
+  }
+
+  .btn-dock-cut,
+  .btn-dock-restore {
+    min-height: 34px;
+    padding: 6px 12px;
+    font-size: 0.78rem;
+  }
+}
+
+
 
 
 

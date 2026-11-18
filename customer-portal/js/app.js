@@ -1204,6 +1204,21 @@
     // Click on map listener for picking custom operating base
     state.map.on('click', handleMapClickPickLocation);
 
+    // Keep map canvas fitted to every device viewport, resize, or phone rotation
+    const refreshMapViewport = () => {
+      if (state.map) {
+        state.map.invalidateSize({ animate: false });
+      }
+    };
+    window.addEventListener('resize', refreshMapViewport);
+    window.addEventListener('orientationchange', () => setTimeout(refreshMapViewport, 180));
+    const mapCanvasEl = document.getElementById('leaflet-map-canvas');
+    if (mapCanvasEl && typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => refreshMapViewport());
+      ro.observe(mapCanvasEl);
+    }
+    setTimeout(refreshMapViewport, 250);
+
     renderAllVehicleMarkers();
   }
 

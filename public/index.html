@@ -1139,16 +1139,69 @@
 
     #portalRegisterForm {
       max-height: 64vh;
+      max-height: 64dvh;
       overflow-y: auto;
       padding-right: 4px;
     }
 
-    @media (max-width: 480px) {
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+    }
+
+    .hero-banner-section {
+      min-height: calc(100vh - 65px);
+      min-height: calc(100dvh - 65px);
+    }
+
+    @media (max-width: 768px) {
+      .hero-content-wrap {
+        padding: 20px 14px 74px;
+        gap: 22px;
+      }
+
+      /* Prevent iOS Safari zoom on input focus */
+      .form-input {
+        font-size: 16px;
+      }
+
       .reg-optional-grid {
         grid-template-columns: 1fr;
       }
+
       #portalRegisterForm {
         max-height: none;
+        overflow-y: visible;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .hero-content-wrap {
+        padding: 16px 12px 72px;
+      }
+
+      .hero-login-card {
+        padding: 18px 14px;
+        border-radius: 16px;
+      }
+
+      .auth-mode-tabs {
+        grid-template-columns: 1fr;
+      }
+
+      .form-label {
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+    }
+
+    @media (max-width: 360px) {
+      .hero-main-title {
+        font-size: 1.32rem;
+      }
+
+      .brand-title {
+        font-size: 1.05rem;
       }
     }
   </style>

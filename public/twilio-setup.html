@@ -146,6 +146,16 @@
       70% { box-shadow: 0 0 0 32px rgba(239, 68, 68, 0); transform: scale(1.06); }
       100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); transform: scale(1); }
     }
+    @media (max-width: 600px) {
+      body { padding: 16px 10px; }
+      .card { padding: 16px 14px; border-radius: 14px; }
+      h1 { font-size: 1.2rem; }
+      h2 { font-size: 1rem; }
+      input { font-size: 16px; }
+      .btn-row { flex-direction: column; gap: 10px; }
+      button { min-width: 0; width: 100%; }
+      .nav-links { flex-wrap: wrap; gap: 10px; }
+    }
   </style>
 </head>
 <body>
