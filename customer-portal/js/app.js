@@ -1597,9 +1597,13 @@
 
     toast.classList.remove('hidden');
 
-    setTimeout(() => {
+    if (state.toastTimer) {
+      clearTimeout(state.toastTimer);
+    }
+    state.toastTimer = setTimeout(() => {
       toast.classList.add('hidden');
-    }, 4500);
+      state.toastTimer = null;
+    }, 3500);
   }
 
   // =========================================================================
@@ -4610,7 +4614,43 @@
 
   function initDeviceOfflineMonitor() {
     bindClick('btn-offline-recheck', () => {
+      state.offlineBannerDismissed = false;
       fetchHardwareDeviceStatus(true);
+    });
+
+    bindClick('btn-offline-dismiss', () => {
+      state.offlineBannerDismissed = true;
+      const banner = document.getElementById('device-offline-banner');
+      if (banner) banner.classList.add('hidden');
+    });
+
+    bindClick('btn-dismiss-toast', () => {
+      if (state.toastTimer) {
+        clearTimeout(state.toastTimer);
+        state.toastTimer = null;
+      }
+      const toast = document.getElementById('territory-toast');
+      if (toast) toast.classList.add('hidden');
+    });
+
+    bindClick('btn-dismiss-network-chip', () => {
+      state.networkChipDismissed = true;
+      const chip = document.getElementById('network-status-chip');
+      if (chip) chip.classList.add('hidden');
+    });
+
+    bindClick('btn-dismiss-dock', () => {
+      const dock = document.getElementById('floating-security-dock');
+      const restorePill = document.getElementById('btn-restore-dock');
+      if (dock) dock.classList.add('hidden');
+      if (restorePill) restorePill.classList.remove('hidden');
+    });
+
+    bindClick('btn-restore-dock', () => {
+      const dock = document.getElementById('floating-security-dock');
+      const restorePill = document.getElementById('btn-restore-dock');
+      if (dock) dock.classList.remove('hidden');
+      if (restorePill) restorePill.classList.add('hidden');
     });
 
     fetchHardwareDeviceStatus(false);
@@ -4633,6 +4673,7 @@
       });
 
       if (anyTimedOut) {
+        state.offlineBannerDismissed = false;
         syncDeviceOnlineOfflineUI('DISCONNECTED');
         return;
       }
@@ -4663,7 +4704,9 @@
         });
 
         state.bikes.forEach((bk, idx) => {
-          const matched = statusByImei[bk.imei] || (state.bikes.length === 1 && anyOnlineDevice ? anyOnlineDevice : null);
+          const matched =
+            statusByImei[bk.imei] ||
+            (idx === state.activeBikeIndex && anyOnlineDevice ? anyOnlineDevice : null);
           const manualFlag = isManualRecheck && idx === state.activeBikeIndex;
           if (matched) {
             applyDeviceConnectionStatus(matched, manualFlag);
@@ -4780,7 +4823,10 @@
     const dot = document.getElementById('network-status-dot');
     const chipText = document.getElementById('network-chip-text');
 
-    if (chip) chip.classList.toggle('is-offline', isOffline);
+    if (chip) {
+      chip.classList.toggle('is-offline', isOffline);
+      chip.classList.toggle('hidden', Boolean(state.networkChipDismissed));
+    }
     if (dot) dot.classList.toggle('offline', isOffline);
 
     if (chipText) {
@@ -4810,8 +4856,8 @@
     // 3. Floating Map Offline Monitoring Banner
     const banner = document.getElementById('device-offline-banner');
     if (banner) {
-      banner.classList.toggle('hidden', !isOffline);
-      if (isOffline) {
+      banner.classList.toggle('hidden', !isOffline || Boolean(state.offlineBannerDismissed));
+      if (isOffline && !state.offlineBannerDismissed) {
         setText('offline-banner-title', `DEVICE OFFLINE — ${bike.plate || 'UEV 412K'} Disconnected`);
         const reasonHint = !state.gatewayReachable
           ? 'Telemetry server unreachable — check server or Wi-Fi connection.'
@@ -4829,9 +4875,11 @@
 
     // 5. Transition Toast & Subtle Audio Feedback
     if (transition === 'DISCONNECTED') {
+      state.hasActuallyDisconnected = true;
       if (audio) audio.playChirp(false);
       showTerritoryToast('📴', 'DEVICE WENT OFFLINE', `${bike.plate} stopped sending telemetry. Showing last known GPS location.`);
-    } else if (transition === 'RECONNECTED') {
+    } else if (transition === 'RECONNECTED' && state.hasActuallyDisconnected) {
+      state.hasActuallyDisconnected = false;
       if (audio) audio.playChirp(true);
       showTerritoryToast('🟢', 'DEVICE BACK ONLINE', `${bike.plate} live telemetry heartbeat restored!`);
     }

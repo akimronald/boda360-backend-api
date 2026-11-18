@@ -268,6 +268,9 @@
             <div class="map-network-chip" id="network-status-chip">
               <span class="status-pulse-dot" id="network-status-dot"></span>
               <span id="network-chip-text">CHECKING DEVICE...</span>
+              <button type="button" class="floating-card-close-btn" id="btn-dismiss-network-chip" title="Hide device online chip" aria-label="Hide device online chip">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
             </div>
           </div>
         </div>
@@ -284,9 +287,14 @@
             <span id="offline-banner-detail">No live telemetry signal from tracker (IMEI: 865421045981201) &bull; Showing last known GPS position.</span>
           </div>
         </div>
-        <button type="button" id="btn-offline-recheck" class="offline-recheck-btn" title="Check hardware connection now">
-          <i class="fa-solid fa-rotate"></i> Check Signal
-        </button>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <button type="button" id="btn-offline-recheck" class="offline-recheck-btn" title="Check hardware connection now">
+            <i class="fa-solid fa-rotate"></i> Check Signal
+          </button>
+          <button type="button" id="btn-offline-dismiss" class="floating-card-close-btn light" title="Dismiss banner" aria-label="Dismiss device banner">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
       </div>
 
       <!-- Emergency Security Breach Notification Ticker (Shown on Tamper/Breach) -->
@@ -358,7 +366,17 @@
           <div class="pipeline-dot"></div>
           <div class="pipeline-pill" id="pipe-pill-4"><i class="fa-solid fa-shield-check"></i> Relay ACK</div>
         </div>
+
+        <button type="button" class="dock-close-btn" id="btn-dismiss-dock" title="Hide floating bottom card from screen" aria-label="Hide floating bottom card">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
       </div>
+
+      <!-- Compact Restore Pill when Bottom Security Dock is Hidden -->
+      <button type="button" class="floating-dock-restore-pill hidden" id="btn-restore-dock" title="Show bike controls card">
+        <i class="fa-solid fa-motorcycle"></i>
+        <span>Show Bike Controls</span>
+      </button>
 
     </main>
 
@@ -916,6 +934,9 @@
       <div class="toast-title" id="toast-title">OPERATIONAL REGION SWITCHED</div>
       <div class="toast-msg" id="toast-msg">Map, coordinates, and safe zones updated.</div>
     </div>
+    <button type="button" class="floating-card-close-btn light" id="btn-dismiss-toast" title="Dismiss notification" aria-label="Dismiss notification">
+      <i class="fa-solid fa-xmark"></i>
+    </button>
   </div>
 
   <!-- =========================================================================
